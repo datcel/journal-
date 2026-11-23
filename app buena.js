@@ -1,0 +1,3425 @@
+/* ============================================================
+   CRT Desk — Futures Prop Tracker
+   Motor de métricas + UI. Persistencia en la nube (Supabase, ver cloud.js) con copia local en IndexedDB.
+   ============================================================ */
+
+const STORE_KEY = 'crtdesk_v1';
+
+/* ============================================================
+   REGLAS MULTI-FIRMA
+   Cada plan = { firm, plan, size, phases:{eval:{...}, funded:{...}} }
+   Campos por fase:
+     profitTarget  — objetivo de profit ($). 0 en funded si no aplica.
+     drawdown      — cantidad del trailing EOD ($)
+     trailLock     — balance de cierre en que el suelo se bloquea (0 = no bloquea)
+     lockedFloor   — suelo una vez bloqueado ($) (0 = no aplica)
+     dailyLoss     — daily loss limit ($). 0 = sin DLL.
+     maxMicro/maxMini — tope de contratos
+     minDays       — mínimo días de trading
+     consistency   — % máx día/total (0 = sin regla)
+     minDailyProfit — mínimo para contar día de payout (funded)
+     payoutCap     — tope de retirada
+   ============================================================ */
+
+// Preset verificado: LucidFlex (support.lucidtrading.com). Eval y funded comparten trailing.
+const FIRM_PRESETS = {
+  'LucidFlex': {
+    trailing:'eod',
+    plans:{
+      '25K': { size:25000, eval:{profitTarget:1250,drawdown:1000,trailLock:26100,lockedFloor:25100,dailyLoss:0,maxMicro:20,maxMini:2,minDays:1,consistency:50,minDailyProfit:100,payoutCap:1000},
+                          funded:{profitTarget:0,drawdown:1000,trailLock:26100,lockedFloor:25100,dailyLoss:0,maxMicro:20,maxMini:2,minDays:5,consistency:0,minDailyProfit:100,payoutCap:1000} },
+      '50K': { size:50000, eval:{profitTarget:3000,drawdown:2000,trailLock:52100,lockedFloor:50100,dailyLoss:0,maxMicro:40,maxMini:4,minDays:1,consistency:50,minDailyProfit:150,payoutCap:2000},
+                          funded:{profitTarget:0,drawdown:2000,trailLock:52100,lockedFloor:50100,dailyLoss:0,maxMicro:40,maxMini:4,minDays:5,consistency:0,minDailyProfit:150,payoutCap:2000} },
+      '100K':{ size:100000,eval:{profitTarget:6000,drawdown:3000,trailLock:103100,lockedFloor:100100,dailyLoss:0,maxMicro:60,maxMini:6,minDays:1,consistency:50,minDailyProfit:200,payoutCap:2500},
+                          funded:{profitTarget:0,drawdown:3000,trailLock:103100,lockedFloor:100100,dailyLoss:0,maxMicro:60,maxMini:6,minDays:5,consistency:0,minDailyProfit:200,payoutCap:2500} },
+      '150K':{ size:150000,eval:{profitTarget:9000,drawdown:4500,trailLock:154600,lockedFloor:150100,dailyLoss:0,maxMicro:100,maxMini:10,minDays:1,consistency:50,minDailyProfit:250,payoutCap:3000},
+                          funded:{profitTarget:0,drawdown:4500,trailLock:154600,lockedFloor:150100,dailyLoss:0,maxMicro:100,maxMini:10,minDays:5,consistency:0,minDailyProfit:250,payoutCap:3000} }
+    }
+  },
+
+  // Topstep — 50K (trailing EOD por elección del usuario). Combine + Express Funded (opción Standard).
+  'Topstep': {
+    trailing:'eod',
+    plans:{
+      '50K': { size:50000,
+        eval:{profitTarget:3000,drawdown:2000,trailLock:0,lockedFloor:0,dailyLoss:1000,maxMicro:50,maxMini:5,minDays:1,consistency:50,minDailyProfit:0,payoutCap:0},
+        funded:{profitTarget:0,drawdown:2000,trailLock:0,lockedFloor:0,dailyLoss:1000,maxMicro:50,maxMini:5,minDays:5,consistency:0,minDailyProfit:150,payoutCap:4000} }
+    }
+  },
+
+  // MyFundedFutures — 50K Builder (Max Drawdown EOD + Daily Drawdown). Micro scaling 10:1.
+  'MyFundedFutures': {
+    trailing:'eod',
+    plans:{
+      '50K Builder': { size:50000,
+        eval:{profitTarget:3000,drawdown:2000,trailLock:0,lockedFloor:0,dailyLoss:1000,maxMicro:40,maxMini:4,minDays:1,consistency:0,minDailyProfit:0,payoutCap:0},
+        funded:{profitTarget:0,drawdown:2000,trailLock:0,lockedFloor:0,dailyLoss:1000,maxMicro:40,maxMini:4,minDays:2,consistency:50,minDailyProfit:0,payoutCap:2000} }
+    }
+  },
+
+  // Cuenta genérica de CFD (oro). Edita los importes en la cuenta si quieres; aquí solo sirve para el ROI.
+  'CFD (genérica)': {
+    trailing:'eod',
+    plans:{
+      'Cuenta': { size:0,
+        eval:{profitTarget:0,drawdown:0,trailLock:0,lockedFloor:0,dailyLoss:0,maxMicro:0,maxMini:0,minDays:1,consistency:0,minDailyProfit:0,payoutCap:0},
+        funded:{profitTarget:0,drawdown:0,trailLock:0,lockedFloor:0,dailyLoss:0,maxMicro:0,maxMini:0,minDays:1,consistency:0,minDailyProfit:0,payoutCap:0} }
+    }
+  },
+
+  // FundedNext Futures — 50K. Max Loss EOD, sin daily loss.
+  'FundedNext': {
+    trailing:'eod',
+    plans:{
+      '50K': { size:50000,
+        eval:{profitTarget:2500,drawdown:1500,trailLock:0,lockedFloor:0,dailyLoss:0,maxMicro:30,maxMini:3,minDays:1,consistency:40,minDailyProfit:0,payoutCap:0},
+        funded:{profitTarget:0,drawdown:1500,trailLock:0,lockedFloor:0,dailyLoss:0,maxMicro:30,maxMini:3,minDays:5,consistency:0,minDailyProfit:0,payoutCap:1500} }
+    }
+  }
+};
+
+const DEFAULTS = {
+  trades: [],
+  accounts: [],
+  noTradeDays: [],   // {id, date, reason, note}
+  propCosts: [],     // {id, date, amount, concept, firm}
+  payouts: [],       // {id, date, amount, concept, firm}
+  paperTrades: [],   // trades SIMULADOS (no operados): mismo formato que trades, sin cuenta ni dinero
+  firms: null,   // se inicializa desde FIRM_PRESETS la primera vez (así el usuario puede editarlas)
+  settings: { riskPerTradePct: 25 },
+  meta: { created: Date.now() }
+};
+
+// Motius de dia sense trade
+const NOTRADE_REASONS = {
+  no_setup:'No había setup válido (el precio no estaba en zona)',
+  no_time:'No pude mirar el mercado',
+  rest:'Descanso / día libre',
+  news:'Noticias o mercado impredecible',
+  stop_done:'Ya había hecho mi stop del día',
+  other:'Otros'
+};
+
+let DB = normalizeDB(null);   // se rellena al entrar (Cloud.start)
+
+// Completa y migra un journal (de la nube, de la copia local o de un JSON importado)
+function normalizeDB(raw){
+  try{
+    if(typeof raw==='string') raw=JSON.parse(raw);
+    const base = raw ? Object.assign(structuredClone(DEFAULTS), raw) : structuredClone(DEFAULTS);
+    // inicializar firmas desde presets si es la primera vez
+    if(!base.firms){ base.firms = structuredClone(FIRM_PRESETS); }
+    // añadir firmas de preset que aún no estén (sin pisar las editadas por el usuario)
+    Object.keys(FIRM_PRESETS).forEach(f=>{
+      if(!base.firms[f]) base.firms[f]=structuredClone(FIRM_PRESETS[f]);
+    });
+    // migrar cuentas viejas (modelo size/maxDD) al nuevo firm/plan
+    (base.accounts||[]).forEach(a=>{
+      if(!a.plan && a.size){
+        a.firm = a.firm||'LucidFlex';
+        a.plan = (a.size/1000)+'K';
+        a.phase = a.phase||'Evaluación';
+      }
+    });
+    // migrar nombres de sesión antiguos a los nuevos
+    const SESSION_MIGRATION={
+      'Londres':'Londres (9-12)',
+      'NY':'NY (15:30+)',
+      'Asia':'Otra',
+      'Overlap':'Otra'
+    };
+    (base.trades||[]).forEach(t=>{
+      if(t.session && SESSION_MIGRATION[t.session]) t.session=SESSION_MIGRATION[t.session];
+    });
+    // Desde nov-2026 la fase se elige en el trade (no se apuntan cuentas): fijar la de los trades antiguos
+    (base.trades||[]).forEach(t=>{
+      if(t.phase==='eval'||t.phase==='funded') return;
+      const acc=(base.accounts||[]).find(a=>a.name===t.account);
+      if(acc) t.phase=acc.phase==='Funded'?'funded':'eval';
+    });
+    return base;
+  }catch(e){
+    const d = structuredClone(DEFAULTS);
+    d.firms = structuredClone(FIRM_PRESETS);
+    return d;
+  }
+}
+
+// Helper: obtener specs de un plan/fase
+function planSpec(firmName, planName, phase){
+  const f = (DB.firms||{})[firmName];
+  if(!f || !f.plans[planName]) return null;
+  const p = f.plans[planName];
+  return { size:p.size, trailing:f.trailing||'eod', ...(p[phase==='Funded'?'funded':'eval']) };
+}
+// Guarda: copia local al instante + subida a la nube (ver cloud.js). Nunca falla por espacio.
+function save(){ if(typeof Cloud!=='undefined') Cloud.changed(); }
+// Captura: atributos <img> (las de la nube se cargan con enlace privado)
+function imgSrc(ref){ return typeof Cloud!=='undefined'?Cloud.imgSrc(ref):ref; }
+function imgAttrs(ref){ const r=typeof Cloud!=='undefined'&&Cloud.isRef(ref); return `${r?`data-ref="${ref}" `:''}src="${imgSrc(ref)}"`; }
+
+/* ---------- helpers ---------- */
+const $ = (s,el=document)=>el.querySelector(s);
+const $$ = (s,el=document)=>[...el.querySelectorAll(s)];
+const uid = ()=>Math.random().toString(36).slice(2,10);
+const fmt = (n,d=2)=> (n==null||isNaN(n)) ? '—' : Number(n).toLocaleString('es-ES',{minimumFractionDigits:d,maximumFractionDigits:d});
+const fmtR = n => (n>0?'+':'')+fmt(n,2)+'R';
+const fmt$ = n => (n<0?'-':'')+'$'+fmt(Math.abs(n),0);
+const cls = n => n>0?'pos':n<0?'neg':'neu';
+const todayISO = ()=> new Date().toISOString().slice(0,10);
+
+function toast(msg){
+  const t=$('#toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(t._t); t._t=setTimeout(()=>t.classList.remove('show'),2200);
+}
+
+/* ============================================================
+   SISTEMA DE AYUDA (?) — explicaciones de cada métrica
+   ============================================================ */
+const HELP_TEXTS={
+  // Resumen
+  expectancy:['Expectancy','Lo que ganas o pierdes de media por trade, en R. Es la métrica más importante: si es +0,3R, cada trade te da de media 0,3 veces lo que arriesgas. Positiva = tienes ventaja; negativa = pierdes a la larga.'],
+  winrate:['Win rate','Porcentaje de trades ganadores. Ojo: un winrate alto no significa ganar dinero — depende de tu R:R. Por eso nunca se mira solo.'],
+  profitfactor:['Profit factor','Dólares ganados ÷ dólares perdidos. Por encima de 1 ganas; 2 significa que ganas el doble de lo que pierdes.'],
+  totalr:['R acumulado','La suma de todos tus R. Tu resultado total en unidades de riesgo, independiente del tamaño de cada trade.'],
+  maxdd:['Max drawdown','La mayor caída desde un pico en tu curva de resultados. Mide tu peor racha: cuánto llegaste a bajar antes de recuperar.'],
+  disccost:['Coste de la indisciplina','Cuántos R y euros pierdes por errores de ejecución. Compara lo que tu plan habría dado con lo que sacaste, en los trades donde marcaste algún error. Te dice en dinero lo que te cuesta saltarte tus reglas.'],
+  equity:['Curva de equity','Tu R acumulado a lo largo del tiempo. La forma de tu progresión: idealmente sube de forma constante.'],
+  cumchart:['Winrate y expectancy acumulados','Cómo evolucionan esas dos métricas trade a trade. Sirve para ver si tu ventaja mejora, se estabiliza o se degrada con el tiempo.'],
+  // Disciplina
+  discrate:['Tasa de disciplina','Porcentaje de trades sin ningún error marcado. Cuanto más alto, más fiel eres a tu plan.'],
+  cleanstreak:['Racha días limpios','Cuántos días seguidos llevas sin cometer errores de ejecución.'],
+  edgeclean:['Edge limpio vs con error','Compara tu expectancy cuando operas limpio contra cuando cometes errores. Te demuestra en números cuánto te penalizan los fallos.'],
+  flagbreakdown:['Desglose por tipo de error','Cuántas veces cometes cada error (FOMO, cierre temprano...) y cuánto R te cuesta cada uno. Te dice cuál atacar primero.'],
+  planadher:['Adherencia al plan','Compara tu expectancy cuando cumples todas las reglas de tu plan vs cuando te saltas alguna. Demuestra si tu plan funciona.'],
+  // Rendimiento
+  avgwin:['Avg win','Tu ganancia media en los trades ganadores, en R.'],
+  avgloss:['Avg loss','Tu pérdida media en los trades perdedores, en R.'],
+  breakdowns:['Desgloses','Tu rendimiento separado por setup, sesión, símbolo... Sirve para ver dónde ganas de verdad y dónde pierdes.'],
+  optimalrr:['R:R óptimo','Usa tu MFE para simular qué TP te daría más rentabilidad. Marca tu objetivo final medio (la siguiente zona o el alto/bajo del macro, del campo "Objetivo final en R") para ver si te compensa más asegurar el 1:2 o dejar correr hasta la zona.'],
+  manualclose:['Cierres manuales','Analiza tus cierres antes del TP. Respeta tu criterio: si marcaste "limpio", fue buena decisión. Solo cuenta como coste los que marcaste con error.'],
+  dolreach:['¿Llega al objetivo final?','De tus trades que no acabaron en stop, cada cuánto el precio llega a tu objetivo final (siguiente zona o alto/bajo del macro). Te dice si aguantar hasta la zona compensa o conviene asegurar el 1:2.'],
+  beanalysis:['Análisis de BE','De tus salidas por BE saltado: cuántos moviste según plan vs por impulso, y cuántos habrían ido a TP (usando el MFE). Te dice si mover el BE pronto te cuesta ganadores.'],
+  sessionmfe:['MFE y MAE por sesión','Compara cómo se mueve el precio en cada sesión: hasta dónde llega a favor (MFE), cuánto aguanta en contra antes de ganar o perder (MAE), cuántas veces llega al objetivo final y qué TP rinde más. Sirve para ajustar TP y SL según la sesión.'],
+  maeanalysis:['¿SL demasiado lejos?','Usa el MAE (cuánto fue el precio en contra) de tus ganadores para ver si tu stop está muy holgado. Si tus ganadores sufren poco antes de girarse, podrías ajustar el SL. Te avisa de no comerte los barridos de liquidez.'],
+  movetype:['Tu estrategia por partes','Compara tu rendimiento por tipo de entrada (Impulso o Retroceso), fractal de referencia (Diario, 4H o 1H), zona (extrema o decisional), dirección y objetivo elegido (asegurar el 1:2 o ir a la zona). Te dice qué parte de tu mecanismo funciona de verdad.'],
+  smt:['RS Scalp (SMT)','De las entradas por SMT que aparecieron (entraras o no): cuántas van a TP y si el timing respecto a la apertura NY influye. Sirve para validar esta subestrategia antes de confiar en ella.'],
+  distribution:['Distribución de R','Cuántos trades caen en cada rango de R. La altura es número de trades. Muestra la forma de tus resultados.'],
+  streaks:['Rachas','Tu racha actual y tus récords de victorias y derrotas seguidas. Ayuda con la psicología: saber tu peor racha histórica te calma cuando encadenas pérdidas.'],
+  daydisc:['Día + disciplina','Tu rendimiento y % de errores por día de la semana. Te dice si un mal día es por el mercado o porque tú operas peor ese día.'],
+  bymonth:['Rendimiento por mes','Tu expectancy, winrate, R acumulado y % de errores mes a mes. Sirve para ver tu evolución en el tiempo y si vas mejorando.'],
+  // Sizing
+  kelly:['Kelly','Termómetro de tu edge, no tu sizing. Valida si tienes ventaja real. Necesita 30+ trades para ser fiable.'],
+  roiglobal:['ROI global','Tu negocio de props: total gastado en cuentas vs total cobrado en payouts. El ROI % te dice cuánto recuperas por cada $ invertido.'],
+  funnel:['Estadística de cuentas','El recorrido de tus cuentas: cuántas pasaste (% aprobación), de las fondeadas cuántas dieron payout (% conversión), y el payout medio. Se calcula con el estado de cada cuenta.']
+};
+let _helpOpen=null;
+function helpIcon(key){ return `<span class="help" onclick="showHelp(event,'${key}')">?</span>`; }
+function showHelp(ev,key){
+  ev.stopPropagation();
+  const pop=$('#helpPop');
+  const h=HELP_TEXTS[key];
+  if(!h){ return; }
+  if(_helpOpen===key){ pop.classList.remove('show'); _helpOpen=null; return; }
+  pop.innerHTML=`<span class="hp-title">${h[0]}</span>${h[1]}`;
+  pop.classList.add('show');
+  _helpOpen=key;
+  // posicionar cerca del icono
+  const r=ev.target.getBoundingClientRect();
+  const pw=280, ph=pop.offsetHeight||120;
+  let left=r.left; let top=r.bottom+8;
+  if(left+pw>window.innerWidth-12) left=window.innerWidth-pw-12;
+  if(top+ph>window.innerHeight-12) top=r.top-ph-8;
+  pop.style.left=Math.max(12,left)+'px';
+  pop.style.top=Math.max(12,top)+'px';
+}
+document.addEventListener('click',e=>{
+  if(!e.target.classList.contains('help')){ const p=$('#helpPop'); if(p){p.classList.remove('show'); _helpOpen=null;} }
+});
+
+/* ============================================================
+   MÉTRICAS — el corazón del dashboard
+   ============================================================ */
+
+// Cada trade:
+// {id, date, session, setup, symbol, account,
+//  plannedR (R objetivo segun TP/SL al entrar),
+//  realizedR (R que sacaste de verdad),
+//  pnl ($ real), riskUSD ($ arriesgado),
+//  result win|loss|be, flags:[], note}
+
+// Filtro global de fase: 'all' | 'eval' | 'funded'
+let PHASE_FILTER = 'all';
+let MONTH_FILTER = []; // meses elegidos 'AAAA-MM'; vacío = todos (compartido entre Disciplina y Rendimiento)
+const MONTH_TABS = ['discipline','performance'];
+
+// Resuelve la fase de un trade a partir de la cuenta asignada
+function tradePhase(t){
+  // La fase se guarda en el trade al crearlo. Los trades viejos sin phase
+  // la deducen de la fase actual de la cuenta (compatibilidad).
+  if(t.phase==='funded'||t.phase==='eval') return t.phase;
+  if(!t.account) return null;
+  const acc = DB.accounts.find(a=>a.name===t.account);
+  if(!acc) return null;
+  return acc.phase==='Funded' ? 'funded' : 'eval';
+}
+
+function tradesFiltered(filterFn){
+  let arr = DB.trades;
+  if(PHASE_FILTER!=='all'){
+    arr = arr.filter(t=> tradePhase(t)===PHASE_FILTER);
+  }
+  return arr.filter(filterFn||(()=>true)).sort((a,b)=> a.date<b.date?1:-1);
+}
+
+function expectancy(trades){
+  if(!trades.length) return 0;
+  const sum = trades.reduce((s,t)=> s + (t.realizedR||0), 0);
+  return sum / trades.length;
+}
+function winrate(trades){
+  const counted = trades.filter(t=>t.result!=='be');
+  if(!counted.length) return 0;
+  return counted.filter(t=>t.result==='win').length / counted.length * 100;
+}
+function avgWin(trades){
+  const w = trades.filter(t=>t.result==='win');
+  return w.length? w.reduce((s,t)=>s+(t.realizedR||0),0)/w.length : 0;
+}
+function avgLoss(trades){
+  const l = trades.filter(t=>t.result==='loss');
+  return l.length? l.reduce((s,t)=>s+(t.realizedR||0),0)/l.length : 0;
+}
+function profitFactor(trades){
+  const gains = trades.filter(t=>t.realizedR>0).reduce((s,t)=>s+t.realizedR,0);
+  const losses = Math.abs(trades.filter(t=>t.realizedR<0).reduce((s,t)=>s+t.realizedR,0));
+  return losses? gains/losses : (gains>0?Infinity:0);
+}
+function totalR(trades){ return trades.reduce((s,t)=>s+(t.realizedR||0),0); }
+function totalPnl(trades){ return trades.reduce((s,t)=>s+(t.pnl||0),0); }
+
+// Rachas de victorias/derrotas (en orden cronológico). BE no rompe racha, la ignora.
+function streaks(trades){
+  const ch=[...trades].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  let maxWin=0, maxLoss=0, curW=0, curL=0, curType=null, curCount=0;
+  ch.forEach(t=>{
+    if(t.result==='win'){ curW++; maxWin=Math.max(maxWin,curW); curL=0; }
+    else if(t.result==='loss'){ curL++; maxLoss=Math.max(maxLoss,curL); curW=0; }
+    // be: no toca las rachas
+  });
+  // racha actual: recorrer desde el final
+  for(let i=ch.length-1;i>=0;i--){
+    const r=ch[i].result;
+    if(r==='be') continue;
+    if(curType===null){ curType=r; curCount=1; }
+    else if(r===curType){ curCount++; }
+    else break;
+  }
+  return { maxWin, maxLoss, curType, curCount };
+}
+
+// Día de la semana cruzado con disciplina: expectancy + tasa de errores por día
+function dayDisciplineBreakdown(trades){
+  const names=['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'];
+  const map={};
+  trades.forEach(t=>{
+    const [yy,mm,dd]=t.date.split('-').map(Number);
+    const wd=new Date(yy,mm-1,dd).getDay();
+    const k=names[wd];
+    map[k]=map[k]||[];
+    map[k].push(t);
+  });
+  // orden lun-vie-sáb-dom
+  const order=['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
+  return order.filter(k=>map[k]).map(k=>{
+    const ts=map[k];
+    const errRate = ts.length? ts.filter(t=>(t.flags||[]).some(f=>f!=='clean')).length/ts.length*100 : 0;
+    return { key:k, n:ts.length, exp:expectancy(ts), wr:winrate(ts), errRate };
+  });
+}
+
+// Rendimiento por mes: expectancy, winrate, R acumulado, nº trades
+function monthBreakdown(trades){
+  const names=['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+  const map={};
+  trades.forEach(t=>{
+    const [yy,mm]=t.date.split('-').map(Number);
+    const k=`${names[mm-1]} ${String(yy).slice(2)}`;
+    const sortKey=yy*100+mm;
+    map[k]=map[k]||{ts:[],sortKey};
+    map[k].ts.push(t);
+  });
+  return Object.keys(map)
+    .sort((a,b)=>map[a].sortKey-map[b].sortKey)
+    .map(k=>{
+      const ts=map[k].ts;
+      const errRate = ts.length? ts.filter(t=>(t.flags||[]).some(f=>f!=='clean')).length/ts.length*100 : 0;
+      return { key:k, n:ts.length, exp:expectancy(ts), wr:winrate(ts), r:ts.reduce((s,t)=>s+(t.realizedR||0),0), errRate };
+    });
+}
+
+/* ---------- R:R óptimo según MFE ----------
+   Para cada nivel de TP simula: si el MFE del trade >= TP -> habría cobrado ese TP (+TP R).
+   Si no -> el trade se habría ido al SL (-1R), asumiendo SL fijo de -1R.
+   Devuelve la expectancy de cada nivel y cuál es el óptimo. */
+// MFE / MAE por sesión: hasta dónde llega el precio a favor, cuánto aguanta en contra,
+// % que llega al objetivo final y R:R óptimo (mismo método que la tarjeta general) en cada sesión.
+function sessionMfeMae(trades){
+  const order=[...SESSIONS];
+  const g={};
+  trades.forEach(t=>{ const k=t.session||'Sin sesión'; (g[k]=g[k]||[]).push(t); if(!order.includes(k)) order.push(k); });
+  const avg=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+  return order.filter(k=>g[k]).map(k=>{
+    const ts=g[k];
+    const mfe=ts.filter(t=>t.mfe!=null&&!isNaN(t.mfe)).map(t=>Math.max(0,t.mfe));
+    const maeW=ts.filter(t=>t.result==='win'&&t.mae!=null&&!isNaN(t.mae)).map(t=>Math.abs(t.mae));
+    const maeL=ts.filter(t=>t.result==='loss'&&t.mae!=null&&!isNaN(t.mae)).map(t=>Math.abs(t.mae));
+    const dol=ts.filter(t=>(t.dolReached==='yes'||t.dolReached==='no')&&t.result!=='loss');
+    const o=optimalRR(ts);
+    return { session:k, n:ts.length, exp:expectancy(ts),
+      nMfe:mfe.length, mfe:avg(mfe),
+      nMaeW:maeW.length, maeW:avg(maeW), maeWmax:maeW.length?Math.max(...maeW):null,
+      nMaeL:maeL.length, maeL:avg(maeL),
+      nDol:dol.length, dolPct:dol.length?dol.filter(t=>t.dolReached==='yes').length/dol.length*100:null,
+      opt:o.enough?o.best:null };
+  });
+}
+
+// Formatea un nivel de TP sin redondear de más: 1 → "1", 1.25 → "1,25", 0.5 → "0,5"
+function fmtTP(x){ return String(Math.round(x*100)/100).replace('.',','); }
+function optimalRR(trades){
+  const withMfe = trades.filter(t=>!isNaN(t.mfe)&&t.mfe!=null);
+  if(withMfe.length<5) return { enough:false, n:withMfe.length };
+  // Escala fina (0,25 en 0,25) para que el óptimo no quede clavado en el primer nivel.
+  const levels=[]; for(let x=0.25;x<=4.0001;x+=0.25) levels.push(Math.round(x*100)/100);
+  const curve = levels.map(tp=>{
+    let sumR=0, wins=0;
+    withMfe.forEach(t=>{
+      const mfe=Math.max(0,t.mfe);
+      const mae=(t.mae!=null&&!isNaN(t.mae))?Math.abs(t.mae):null;
+      if(mfe>=tp){ sumR+=tp; wins++; }                       // el precio alcanzó este TP
+      else if(t.result==='loss' || (mae!=null && mae>=1)) sumR+=-1; // no llegó y el precio tocó el SL
+      // no llegó al TP NI tocó el SL (BE, cierre manual...) → 0R: no sabemos más, no lo contamos como pérdida
+    });
+    return { tp, exp:sumR/withMfe.length, wr:wins/withMfe.length*100 };
+  });
+  const best = curve.reduce((a,b)=> b.exp>a.exp?b:a, curve[0]);
+  // objetivo final medio en R: MFE medio de los trades donde SÍ llegó al objetivo final
+  // objetivo final medio en R: media del campo dolR real (registrado por el trader), no del MFE.
+  // El MFE sobreestima porque el precio a veces pasa de largo del objetivo final.
+  const dolTrades = trades.filter(t=>!isNaN(t.dolR)&&t.dolR!=null&&t.dolR>0);
+  const avgDol = dolTrades.length? dolTrades.reduce((s,t)=>s+t.dolR,0)/dolTrades.length : null;
+  return { enough:true, n:withMfe.length, curve, best, avgDol, dolN:dolTrades.length };
+}
+
+
+// COSTE DE LA INDISCIPLINA — métrica estrella
+// Diferencia entre lo planificado y lo realizado en trades marcados con error.
+// Si cerraste antes de tiempo un ganador, o entraste por FOMO, etc.
+// Errores de ENTRADA: el trade no debería haber existido → su resultado entero es el coste.
+const ENTRY_ERROR_FLAGS=['no_zone','no_confirm','sl_over','rr_low','doubt','fomo','revenge'];
+// Coste real (en R) de los errores de UN trade. Positivo = te costó; negativo = el error salió bien por suerte.
+//  · Error de entrada → -R realizado (si no hubieras entrado, tendrías 0R).
+//  · Cierre temprano → solo cuesta si el precio SÍ llegó a tu TP (MFE ≥ R planificado): TP − realizado.
+//  · Moví el stop → lo perdido más allá de -1R.
+//  · Sobre-dimensioné → no cambia el R (el daño es en $), coste 0R.
+function tradeErrorCost(t){
+  const flags=(t.flags||[]).filter(f=>f!=='clean');
+  if(!flags.length) return 0;
+  const r=t.realizedR||0;
+  if(flags.some(f=>ENTRY_ERROR_FLAGS.includes(f))) return -r;
+  let cost=0;
+  if(flags.includes('early_close')){
+    const mfe=t.mfe, plan=t.plannedR||0;
+    if(mfe!=null && !isNaN(mfe) && mfe>=plan) cost+=Math.max(0, plan-r);
+  }
+  // No aseguré el 1:2 → solo cuesta si el precio SÍ llegó a 2R: 2R − realizado.
+  if(flags.includes('no_secure')){
+    const mfe=t.mfe;
+    if(mfe!=null && !isNaN(mfe) && mfe>=2) cost+=Math.max(0, 2-r);
+  }
+  if(flags.includes('moved_stop')) cost+=Math.max(0, -r-1);
+  return cost;
+}
+function disciplineCost(trades){
+  let lostR = 0, lost$ = 0, luckyR = 0, luckyN = 0, flaggedCount = 0, cleanCount = 0;
+  trades.forEach(t=>{
+    const hasError = (t.flags||[]).some(f=>f!=='clean');
+    if(hasError){
+      flaggedCount++;
+      const c=tradeErrorCost(t);
+      lostR += c;
+      lost$ += c * (t.riskUSD||0);
+      if(c<0){ luckyR+=-c; luckyN++; }
+    } else { cleanCount++; }
+  });
+  // lostR es NETO: lo que tus errores te han costado de verdad (las ganancias por suerte lo compensan).
+  return { lostR, lost$, luckyR, luckyN, flaggedCount, cleanCount, total: trades.length };
+}
+
+// Tasa de disciplina (% trades sin errores)
+function disciplineRate(trades){
+  if(!trades.length) return 100;
+  const clean = trades.filter(t=> !(t.flags||[]).some(f=>f!=='clean')).length;
+  return clean/trades.length*100;
+}
+
+// Racha actual de días limpios (sin ningún trade con error)
+function cleanDayStreak(trades){
+  const byDay = {};
+  trades.forEach(t=>{
+    byDay[t.date] = byDay[t.date]||[];
+    byDay[t.date].push(t);
+  });
+  const days = Object.keys(byDay).sort().reverse();
+  let streak=0;
+  for(const d of days){
+    const dirty = byDay[d].some(t=>(t.flags||[]).some(f=>f!=='clean'));
+    if(dirty) break;
+    streak++;
+  }
+  return streak;
+}
+
+// Breakdown por dimensión (setup, session, symbol, weekday)
+function breakdown(trades, key){
+  const map={};
+  trades.forEach(t=>{
+    let k = t[key];
+    if(key==='weekday') k = ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'][new Date(t.date).getDay()];
+    k = k||'—';
+    map[k]=map[k]||[];
+    map[k].push(t);
+  });
+  return Object.entries(map).map(([k,ts])=>({
+    key:k, n:ts.length, r:totalR(ts), exp:expectancy(ts), wr:winrate(ts), pnl:totalPnl(ts)
+  })).sort((a,b)=>b.r-a.r);
+}
+
+// Equity curve (R acumulado en orden cronológico)
+function equityCurve(trades){
+  const ch = [...trades].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  let cum=0; const pts=[];
+  ch.forEach(t=>{ cum+=(t.realizedR||0); pts.push({date:t.date, cum}); });
+  return pts;
+}
+
+// Max drawdown sobre la curva de equity en R
+function maxDrawdownR(trades){
+  const curve = equityCurve(trades).map(p=>p.cum);
+  let peak=0, maxDD=0;
+  curve.forEach(v=>{ peak=Math.max(peak,v); maxDD=Math.max(maxDD, peak-v); });
+  return maxDD;
+}
+
+/* ---------- Kelly / sizing ---------- */
+// Kelly fraction usando winrate y ratio ganancia/perdida
+function kellyFraction(trades){
+  const wr = winrate(trades)/100;
+  const aw = avgWin(trades);
+  const al = Math.abs(avgLoss(trades));
+  if(!al || !aw) return 0;
+  const b = aw/al; // payoff ratio
+  const k = wr - (1-wr)/b;
+  return k; // puede ser negativo si no hay edge
+}
+/* ============================================================
+   VISTAS / RENDER
+   ============================================================ */
+
+let CURRENT_TAB = 'overview';
+let charts = {};
+
+function destroyCharts(){ Object.values(charts).forEach(c=>{try{c.destroy()}catch(e){}}); charts={}; }
+
+function render(){
+  destroyCharts();
+  const v = $('#view');
+  let T = tradesFiltered();
+  // pestañas donde el filtro eval/funded tiene sentido
+  const metricTabs=['overview','discipline','performance'];
+  const showFilter = metricTabs.includes(CURRENT_TAB);
+  // filtro por mes (solo Disciplina y Rendimiento)
+  const showMonth = MONTH_TABS.includes(CURRENT_TAB);
+  if(showMonth && MONTH_FILTER.length) T = T.filter(t=>MONTH_FILTER.includes((t.date||'').slice(0,7)));
+  // Los días mínimos no son trading normal: fuera de las pestañas de métricas (sí en calendario, journal y ROI)
+  const MD = T.filter(isMinDay);
+  if(showFilter) T = T.filter(t=>!isMinDay(t));
+  const filterBars = () => showFilter
+    ? `<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start">${phaseFilterBar()}${showMonth?monthFilterBar():''}</div>`
+    : '';
+  const hasNoTrade=(DB.noTradeDays||[]).length>0;
+  if(CURRENT_TAB!=='roi' && CURRENT_TAB!=='sim' && !T.length && !(CURRENT_TAB==='calendar'&&hasNoTrade)){
+    // Hay trades pero ninguno con este filtro (mes / Eval-Funded): no mostrar "aún no hay trades"
+    v.innerHTML = filterBars() + (DB.trades.length && showFilter
+      ? `<div class="empty"><div class="ico">◴</div><p class="hint">No hay trades con este filtro. Cambia el mes o Eval/Funded.</p></div>`
+      : emptyState());
+    return;
+  }
+  ({
+    overview:renderOverview,
+    discipline:renderDiscipline,
+    performance:renderPerformance,
+    roi:renderROI,
+    calendar:renderCalendar,
+    journal:renderJournal,
+    sim:renderSim
+  })[CURRENT_TAB](v, T);
+  if(CURRENT_TAB==='performance' && MD.length) v.insertAdjacentHTML('beforeend', minDayCard(MD));
+  // prepend filter bar en pestañas de métricas
+  if(showFilter){
+    v.insertAdjacentHTML('afterbegin', filterBars());
+  }
+}
+
+function phaseFilterBar(){
+  const opts=[['all','Todo'],['eval','Eval'],['funded','Funded']];
+  // contar trades por fase para mostrar
+  const NT_=DB.trades.filter(t=>!isMinDay(t));   // los días mínimos van aparte
+  const counts={all:NT_.length, eval:0, funded:0};
+  NT_.forEach(t=>{ const p=tradePhase(t); if(p)counts[p]++; });
+  return `<div class="phase-filter">
+    ${opts.map(([k,label])=>`<button class="phase-btn ${PHASE_FILTER===k?'active':''}" onclick="setPhaseFilter('${k}')">${label} <span class="pf-count">${counts[k]}</span></button>`).join('')}
+  </div>`;
+}
+function setPhaseFilter(p){ PHASE_FILTER=p; render(); }
+
+// Selector de mes (Disciplina y Rendimiento). Los meses salen de tus trades (respetando el filtro Eval/Funded).
+const MONTH_NAMES_SHORT=['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+function monthLabel(ym){ const [y,m]=ym.split('-'); return MONTH_NAMES_SHORT[+m-1]+' '+y.slice(2); }
+function monthFilterBar(){
+  const base=tradesFiltered();
+  const counts={};
+  base.forEach(t=>{ const ym=(t.date||'').slice(0,7); if(ym) counts[ym]=(counts[ym]||0)+1; });
+  MONTH_FILTER.forEach(m=>{ if(!counts[m]) counts[m]=0; }); // mantener visibles los meses elegidos
+  const months=Object.keys(counts).sort();
+  return `<div class="phase-filter" style="flex-wrap:wrap">
+    <button class="phase-btn ${!MONTH_FILTER.length?'active':''}" onclick="setMonthFilter('all')">Todos los meses <span class="pf-count">${base.length}</span></button>
+    ${months.map(ym=>`<button class="phase-btn ${MONTH_FILTER.includes(ym)?'active':''}" onclick="setMonthFilter('${ym}')" title="Pulsa para añadir o quitar este mes">${monthLabel(ym)} <span class="pf-count">${counts[ym]}</span></button>`).join('')}
+  </div>`;
+}
+// Selección múltiple: pulsar un mes lo añade o lo quita; "Todos" limpia la selección
+function setMonthFilter(m){
+  if(m==='all') MONTH_FILTER=[];
+  else MONTH_FILTER = MONTH_FILTER.includes(m) ? MONTH_FILTER.filter(x=>x!==m) : [...MONTH_FILTER, m].sort();
+  render();
+}
+
+function emptyState(){
+  return `<div class="empty">
+    <div class="ico">◴</div>
+    <p style="font-size:15px;color:var(--ink-dim);margin-bottom:6px">Aún no hay trades registrados</p>
+    <p class="hint" style="max-width:340px;margin:0 auto 18px">Empieza añadiendo tu primer trade. Registra el R planificado y el realizado para activar el coste de la indisciplina.</p>
+    <button class="btn primary" onclick="openTradeModal()">+ Añadir primer trade</button>
+  </div>`;
+}
+
+/* ---------- gauge SVG ---------- */
+function gauge(pct, label, color){
+  const r=64, c=2*Math.PI*r, off=c-(pct/100)*c;
+  return `<div class="gauge">
+    <svg width="150" height="150" viewBox="0 0 150 150">
+      <circle cx="75" cy="75" r="${r}" fill="none" stroke="var(--line)" stroke-width="11"/>
+      <circle cx="75" cy="75" r="${r}" fill="none" stroke="${color}" stroke-width="11"
+        stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}"/>
+    </svg>
+    <div class="center"><div><div class="big" style="color:${color}">${Math.round(pct)}<span style="font-size:16px">%</span></div><div class="cap">${label}</div></div></div>
+  </div>`;
+}
+
+function statCard(label,val,delta,deltaCls){
+  return `<div class="card stat">
+    <div class="label">${label}</div>
+    <div class="val">${val}</div>
+    ${delta?`<div class="delta ${deltaCls||''}">${delta}</div>`:''}
+  </div>`;
+}
+
+/* ============================================================
+   OVERVIEW
+   ============================================================ */
+function renderOverview(v, T){
+  const exp = expectancy(T);
+  const wr = winrate(T);
+  const pf = profitFactor(T);
+  const tR = totalR(T);
+  const tP = totalPnl(T);
+  const dc = disciplineCost(T);
+  const dr = disciplineRate(T);
+  const ddR = maxDrawdownR(T);
+
+  v.innerHTML = `
+    <div class="grid g-4" style="margin-bottom:14px">
+      ${statCard('Expectancy', fmtR(exp), exp>=0?'edge positivo':'sin edge', cls(exp))}
+      ${statCard('Win rate', fmt(wr,1)+'%', `PF ${pf===Infinity?'∞':fmt(pf,2)}`, 'neu')}
+      ${statCard('R acumulado', fmtR(tR), fmt$(tP), cls(tR))}
+      ${statCard('Max DD', '-'+fmt(ddR,2)+'R', `${T.length} trades`, 'neu')}
+    </div>
+
+    <div class="card disc-card" style="margin-bottom:14px">
+      <h3>Coste de la indisciplina ${helpIcon("disccost")} <span style="color:var(--ink-faint);text-transform:none;font-weight:400">tu métrica nº1</span></h3>
+      <div class="disc-wrap">
+        ${gauge(dr, 'disciplina', dr>=80?'var(--green)':dr>=60?'var(--amber)':'var(--red)')}
+        <div class="disc-detail">
+          <div class="row"><span class="k">R perdido por errores</span><span class="v ${dc.lostR>0?'neg':'pos'}">${fmtR(-dc.lostR||0)}</span></div>
+          <div class="row"><span class="k">En dinero</span><span class="v ${dc.lostR>0?'neg':'pos'}">${fmt$(-dc.lost$||0)}</span></div>
+          <div class="row"><span class="k">Trades con error</span><span class="v">${dc.flaggedCount} / ${dc.total}</span></div>
+          <div class="row"><span class="k">Racha días limpios</span><span class="v pos">${cleanDayStreak(T)} 🔥</span></div>
+        </div>
+      </div>
+      ${dc.lostR>0?`<div class="insight bad" style="margin-top:16px">Siguiendo tu plan habrías sumado <b>${fmt(dc.lostR,2)}R más</b> (${fmt$(dc.lost$)}). Se calcula así: los trades que no debían existir (FOMO, sin setup, revenge...) cuentan su resultado entero, y los cierres por miedo solo cuentan si el precio llegó de verdad a tu TP.${dc.luckyN?` Ojo: ${dc.luckyN} trade(s) con error salieron bien por suerte (+${fmt(dc.luckyR,2)}R); ya están descontados, pero no cuentes con que se repita.`:''}</div>`:dc.flaggedCount?`<div class="insight warn" style="margin-top:16px">En neto tus errores no te han restado R: ${dc.luckyN} trade(s) con error salieron bien por suerte (+${fmt(dc.luckyR,2)}R). Que salga bien no lo convierte en buena decisión.</div>`:`<div class="insight" style="margin-top:16px">Sin coste de indisciplina detectado en este periodo. Mantén el registro honesto de los flags para que la métrica siga siendo útil.</div>`}
+    </div>
+
+    <div class="grid g-2">
+      <div class="card">
+        <h3>Curva de equity (R) ${helpIcon("equity")}</h3>
+        <div style="position:relative;height:220px"><canvas id="equityChart"></canvas></div>
+      </div>
+      <div class="card">
+        <h3>Winrate y expectancy acumulados ${helpIcon("cumchart")}</h3>
+        <div style="position:relative;height:220px"><canvas id="cumChart"></canvas></div>
+        <div class="legend"><span><span class="dot" style="background:var(--blue)"></span>Winrate %</span><span><span class="dot" style="background:var(--green)"></span>Expectancy (R)</span></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:14px">
+      <h3>Rendimiento por setup</h3>
+      ${breakdownTable(breakdown(T,'setup'))}
+    </div>
+
+    ${autoInsights(T)}
+  `;
+  drawEquity('equityChart', T);
+  drawCumulative('cumChart', T);
+}
+
+function breakdownTable(rows){
+  if(!rows.length) return `<p class="hint">Sin datos</p>`;
+  return `<div class="table-wrap" style="border:none"><table style="min-width:auto">
+    <thead><tr><th>Categoría</th><th>N</th><th>Exp</th><th>WR</th><th>R</th></tr></thead>
+    <tbody>${rows.map(r=>`<tr>
+      <td style="font-family:var(--sans);font-weight:600">${r.key}</td>
+      <td>${r.n}</td>
+      <td class="${cls(r.exp)}">${fmtR(r.exp)}</td>
+      <td>${fmt(r.wr,0)}%</td>
+      <td class="${cls(r.r)}">${fmtR(r.r)}</td>
+    </tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+function autoInsights(T){
+  const ins=[];
+  // mejor y peor setup
+  const bs = breakdown(T,'setup');
+  if(bs.length>=2){
+    const best=bs[0], worst=bs[bs.length-1];
+    if(best.exp>0) ins.push({t:`Tu mejor setup es <b>${best.key}</b> con ${fmtR(best.exp)} de expectancy sobre ${best.n} trades.`,c:''});
+    if(worst.exp<0) ins.push({t:`<b>${worst.key}</b> tiene expectancy negativa (${fmtR(worst.exp)}). Plantéate filtrar o suspender este setup.`,c:'bad'});
+  }
+  // sesión
+  const sb = breakdown(T,'session');
+  if(sb.length>=2){
+    const bestS=sb[0];
+    ins.push({t:`Operas mejor en sesión <b>${bestS.key}</b> (${fmtR(bestS.exp)} exp). Concentra ahí tu tamaño.`,c:''});
+  }
+  // flags más comunes
+  const flagCount={};
+  T.forEach(t=>(t.flags||[]).forEach(f=>{if(f!=='clean'){flagCount[f]=(flagCount[f]||0)+1}}));
+  const topFlag = Object.entries(flagCount).sort((a,b)=>b[1]-a[1])[0];
+  if(topFlag) ins.push({t:`Tu error más repetido: <b>${FLAG_LABELS[topFlag[0]]||topFlag[0]}</b> (${topFlag[1]} veces). Ponlo en tu checklist pre-sesión.`,c:'warn'});
+
+  if(!ins.length) return '';
+  return `<div style="margin-top:14px">${ins.map(i=>`<div class="insight ${i.c}">${i.t}</div>`).join('')}</div>`;
+}
+
+/* ============================================================
+   DISCIPLINE
+   ============================================================ */
+function renderDiscipline(v, T){
+  const dc = disciplineCost(T);
+  const dr = disciplineRate(T);
+  // por flag
+  const flagStats={};
+  Object.keys(FLAG_LABELS).forEach(f=>{ if(f!=='clean') flagStats[f]={n:0,lostR:0}; });
+  T.forEach(t=>{
+    (t.flags||[]).forEach(f=>{
+      if(f!=='clean' && flagStats[f]){
+        flagStats[f].n++;
+        flagStats[f].lostR+=tradeErrorCost(t);
+      }
+    });
+  });
+  const flagRows=Object.entries(flagStats).filter(([k,s])=>s.n>0).sort((a,b)=>b[1].lostR-a[1].lostR);
+
+  // disciplina vs resultado: ¿los trades limpios rinden mejor?
+  const clean=T.filter(t=>!(t.flags||[]).some(f=>f!=='clean'));
+  const dirty=T.filter(t=>(t.flags||[]).some(f=>f!=='clean'));
+
+  v.innerHTML=`
+    <div class="section-title">Disciplina & errores</div>
+    <div class="grid g-3" style="margin-bottom:14px">
+      ${statCard('Tasa de disciplina', fmt(dr,1)+'%', `${dc.cleanCount} trades limpios`, dr>=80?'pos':'neg')}
+      ${statCard('Coste total errores', fmtR(-dc.lostR||0), fmt$(-dc.lost$||0), dc.lostR>0?'neg':'pos')}
+      ${statCard('Racha días limpios', cleanDayStreak(T)+' días', 'sin errores', 'pos')}
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>¿Tu edge sobrevive a los errores? ${helpIcon("edgeclean")}</h3>
+      <div class="grid g-2">
+        <div class="calc-out">
+          <div class="label" style="color:var(--green);font-size:11px;font-weight:600;margin-bottom:6px">TRADES LIMPIOS (${clean.length})</div>
+          <div class="big pos">${fmtR(expectancy(clean))}</div>
+          <div class="hint" style="margin-top:6px">WR ${fmt(winrate(clean),0)}% · PF ${fmt(profitFactor(clean),2)}</div>
+        </div>
+        <div class="calc-out">
+          <div class="label" style="color:var(--red);font-size:11px;font-weight:600;margin-bottom:6px">TRADES CON ERROR (${dirty.length})</div>
+          <div class="big neg">${fmtR(expectancy(dirty))}</div>
+          <div class="hint" style="margin-top:6px">WR ${fmt(winrate(dirty),0)}% · PF ${fmt(profitFactor(dirty),2)}</div>
+        </div>
+      </div>
+      ${clean.length&&dirty.length?`<div class="insight warn" style="margin-top:14px">La diferencia de expectancy entre operar limpio y operar con errores es de <b>${fmtR(expectancy(clean)-expectancy(dirty))}</b> por trade. Multiplícalo por tu volumen mensual para ver el coste real anual.</div>`:''}
+    </div>
+
+    <div class="card">
+      <h3>Desglose por tipo de error ${helpIcon("flagbreakdown")}</h3>
+      ${flagRows.length?`<div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th>Error</th><th>Veces</th><th>R perdido</th><th>% de tus trades</th></tr></thead>
+        <tbody>${flagRows.map(([k,s])=>`<tr>
+          <td style="font-family:var(--sans);font-weight:600">${FLAG_LABELS[k]}</td>
+          <td>${s.n}</td>
+          <td class="${s.lostR>0?'neg':s.lostR<0?'pos':''}">${fmtR(-s.lostR||0)}</td>
+          <td>${fmt(s.n/T.length*100,0)}%</td>
+        </tr>`).join('')}</tbody></table></div>`:`<p class="hint">Ningún error registrado. 🎯</p>`}
+    </div>
+
+    ${(()=>{
+      const withPlan=T.filter(t=>t.planChecked!=null);
+      if(withPlan.length<3) return '';
+      const full=withPlan.filter(t=>planComplete(t));
+      const partial=withPlan.filter(t=>!planComplete(t));
+      if(!full.length||!partial.length) return '';
+      const diff=expectancy(full)-expectancy(partial);
+      return `<div class="card" style="margin-top:14px">
+        <h3>Adherencia al plan ${helpIcon("planadher")}</h3>
+        <div class="grid g-2">
+          <div class="calc-out">
+            <div class="label" style="color:var(--green);font-size:11px;font-weight:600;margin-bottom:6px">PLAN COMPLETO (${full.length})</div>
+            <div class="big pos">${fmtR(expectancy(full))}</div>
+            <div class="hint" style="margin-top:6px">WR ${fmt(winrate(full),0)}%</div>
+          </div>
+          <div class="calc-out">
+            <div class="label" style="color:var(--amber);font-size:11px;font-weight:600;margin-bottom:6px">PLAN INCOMPLETO (${partial.length})</div>
+            <div class="big ${cls(expectancy(partial))}">${fmtR(expectancy(partial))}</div>
+            <div class="hint" style="margin-top:6px">WR ${fmt(winrate(partial),0)}%</div>
+          </div>
+        </div>
+        ${diff>=0.2&&full.length>=10&&partial.length>=10?`<div class="insight warn" style="margin-top:14px">Cuando cumples todas las reglas de tu plan ganas <b>${fmtR(diff)} más</b> por trade que cuando te saltas alguna. Tu plan funciona — respétalo.</div>`:diff>0?`<div class="insight" style="margin-top:14px">Cumpliendo todo el plan vas <b>${fmtR(diff)}</b> por trade mejor, pero la diferencia es pequeña o hay pocos trades (${full.length} completos): todavía no demuestra nada. Sigue registrando.</div>`:`<div class="insight" style="margin-top:14px">Aún no hay diferencia clara entre cumplir todo el plan o no. Sigue registrando para que el dato sea fiable.</div>`}
+      </div>`;
+    })()}
+  `;
+}
+
+/* ============================================================
+   PERFORMANCE
+   ============================================================ */
+// Lista desplegable "Ver trades (N)": cada fila abre la ventana completa del trade.
+// items: [{t, tag, tone}] con tone 'bad' | 'warn' | 'ok' | 'neutral'
+function tradeDrillList(items, opts={}){
+  if(!items.length) return '';
+  const fn=opts.fn||'editTrade';
+  const d=t=>{ const [y,m,dd]=t.date.split('-'); return `${dd}/${m}/${y.slice(2)}`; };
+  const R=x=>x==null||isNaN(x)?'—':fmt(x,2)+'R';
+  return `<details style="margin-top:12px" ${opts.open?'open':''}>
+    <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--blue);padding:6px 0;user-select:none">${opts.label||'Ver trades'} (${items.length})</summary>
+    <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+      ${items.map(({t,tag,tone})=>{
+        const errs=(t.flags||[]).filter(f=>f!=='clean').map(f=>FLAG_LABELS[f]||f);
+        const hot=tone==='bad';
+        return `<div onclick="${fn}('${t.id}')" title="Abrir el trade" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 11px;border:1px solid ${hot?'rgba(255,90,90,.45)':'var(--line)'};border-radius:9px;background:${hot?'rgba(255,90,90,.06)':'transparent'}">
+          <div style="min-width:0">
+            <div style="font-weight:600;font-size:13px">${d(t)} · ${t.symbol||'—'} <span class="hint">${t.session||''}${t.setup?' · '+t.setup.replace('Setup ',''):''}</span></div>
+            <div class="hint" style="margin-top:2px">Realizado ${fmtR(t.realizedR||0)} · TP ${R(t.plannedR)} · MFE ${R(t.mfe)}${errs.length?' · '+errs.join(', '):' · limpio'}</div>
+          </div>
+          <span class="tag ${tone}" style="white-space:nowrap;flex-shrink:0">${tag} ›</span>
+        </div>`;
+      }).join('')}
+    </div>
+  </details>`;
+}
+
+/* ============================================================
+   DÍAS MÍNIMOS (fondeadas) — aparte del trading normal
+   ============================================================ */
+function minDayStats(arr){
+  const W=arr.filter(t=>(t.pnl||0)>0), Lo=arr.filter(t=>(t.pnl||0)<0);
+  const avgW=W.length?W.reduce((s,t)=>s+t.pnl,0)/W.length:null;
+  const avgL=Lo.length?Lo.reduce((s,t)=>s+Math.abs(t.pnl),0)/Lo.length:null;
+  const risks=arr.map(t=>t.riskUSD).filter(x=>x>0);
+  const avgRisk=risks.length?risks.reduce((a,b)=>a+b,0)/risks.length:null;
+  // % de acierto necesario para no perder dinero: pérdida media / (pérdida media + ganancia media).
+  // Sin pérdidas todavía, se estima con el riesgo medio (lo que perderías si salta el stop).
+  const lossRef=avgL!=null?avgL:avgRisk;
+  const beWR=(lossRef&&avgW)?lossRef/(lossRef+avgW)*100:null;
+  const wr=(W.length+Lo.length)?W.length/(W.length+Lo.length)*100:null;
+  const withPlan=arr.filter(t=>t.planChecked!=null);
+  return { n:arr.length, w:W.length, l:Lo.length, be:arr.length-W.length-Lo.length, wr, beWR, avgW, avgL, avgRisk,
+    net:arr.reduce((s,t)=>s+(t.pnl||0),0), worst:Lo.length?Math.min(...Lo.map(t=>t.pnl)):null,
+    daysPerStop:(lossRef&&avgW)?lossRef/avgW:null, full:withPlan.filter(planComplete).length, withPlan:withPlan.length };
+}
+// Días mínimos por sesión: dónde salen mejor
+function minDayBySession(arr){
+  const g={}; arr.forEach(t=>{ const k=t.session||'Sin sesión'; (g[k]=g[k]||[]).push(t); });
+  return Object.entries(g).map(([k,a])=>[k,minDayStats(a)]).sort((x,y)=>y[1].n-x[1].n);
+}
+function minDaySessionTable(arr){
+  const rows=minDayBySession(arr);
+  if(!rows.length) return '';
+  const best=rows.filter(([,s])=>s.n>=3).sort((x,y)=>y[1].net-x[1].net)[0];
+  return `<div class="table-wrap" style="border:none;margin-top:12px"><table style="min-width:auto">
+      <thead><tr><th>Sesión</th><th>N</th><th>Ganados / perdidos</th><th>Acierto</th><th>Necesario</th><th>Neto</th><th>Peor día</th></tr></thead>
+      <tbody>${rows.map(([k,s])=>`<tr>
+        <td style="font-family:var(--sans);font-weight:600">${k}</td>
+        <td>${s.n}</td>
+        <td>${s.w} / ${s.l}</td>
+        <td class="${s.wr==null||s.beWR==null?'':s.wr>=s.beWR?'pos':'neg'}">${s.wr==null?'—':fmt(s.wr,0)+'%'}</td>
+        <td>${s.beWR==null?'—':fmt(s.beWR,0)+'%'}</td>
+        <td class="${cls(s.net)}">${fmt$(s.net)}</td>
+        <td>${s.worst==null?'—':fmt$(s.worst)}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="hint" style="margin-top:6px">${best?`Mejor sesión de momento: <b>${best[0]}</b> (${fmt$(best[1].net)} en ${best[1].n} días).`:'Con menos de 3 días por sesión aún no se puede comparar.'} Con pocos días, un solo stop cambia la tabla.</div>`;
+}
+function minDayCard(arr){
+  const s=minDayStats(arr);
+  const wrCls=s.wr==null||s.beWR==null?'':s.wr>=s.beWR?'pos':'neg';
+  const verdict=s.beWR==null?'':
+    s.wr==null?'':
+    s.wr>=s.beWR?`Ahora mismo te salen a cuenta: aciertas el <b>${fmt(s.wr,0)}%</b> y necesitas el <b>${fmt(s.beWR,0)}%</b>. Ojo: con pocos datos, un solo stop cambia el resultado.`
+    :`<b>Te están costando dinero</b>: aciertas el ${fmt(s.wr,0)}% y necesitas el ${fmt(s.beWR,0)}% para no perder. Plantéate otra forma de cumplir los días (menos riesgo o un trade normal pequeño).`;
+  return `<div class="card" style="margin-top:14px">
+    <h3>Días mínimos (fondeadas) 📅 <span class="hint" style="text-transform:none;letter-spacing:0">no cuentan en las estadísticas de arriba</span></h3>
+    <div class="grid g-4" style="margin-bottom:12px">
+      ${statCard('Días mínimos', s.n, `${s.w} ganados · ${s.l} perdidos${s.be?' · '+s.be+' BE':''}`)}
+      ${statCard('Acierto', s.wr==null?'—':fmt(s.wr,0)+'%', s.beWR==null?'necesitas datos de ganancia y riesgo':`necesitas ${fmt(s.beWR,0)}% para no perder`, wrCls)}
+      ${statCard('Neto', fmt$(s.net), s.worst!=null?'peor día '+fmt$(s.worst):'sin pérdidas aún', cls(s.net))}
+      ${statCard('1 stop =', s.daysPerStop==null?'—':fmt(s.daysPerStop,1)+' días', s.avgW!=null?`ganas ${fmt$(s.avgW)} · ${s.avgL!=null?'pierdes '+fmt$(-s.avgL):'riesgo '+fmt$(-(s.avgRisk||0))}`:'')}
+    </div>
+    ${verdict?`<div class="insight ${wrCls==='neg'?'warn':''}">${verdict}</div>`:''}
+    ${minDaySessionTable(arr)}
+    <div class="hint" style="margin-top:10px">Reglas cumplidas (${PLAN_DIA_MINIMO.join(' · ')}): <b>${s.full}</b> de ${s.withPlan}. Las pérdidas salen del drawdown de la cuenta fondeada.</div>
+    ${tradeDrillList([...arr].sort((a,b)=>a.date<b.date?1:-1).map(t=>({t,tag:(t.pnl||0)>0?fmt$(t.pnl):(t.pnl||0)<0?fmt$(t.pnl):'BE',tone:(t.pnl||0)>0?'ok':(t.pnl||0)<0?'bad':'neutral'})),{label:'Ver días mínimos'})}
+  </div>`;
+}
+
+/* ============================================================
+   SIMULADOS — trades que tomarías pero no operas (p. ej. NY)
+   Se guardan en DB.paperTrades y NUNCA cuentan en las estadísticas reales.
+   ============================================================ */
+const NY_SESSION='Nueva York (14:30-22h)';
+function renderSim(v){
+  const S=[...(DB.paperTrades||[])].sort((a,b)=> a.date<b.date?1:-1);
+  const R=(DB.trades||[]).filter(t=>!isMinDay(t));
+  const wrT=arr=>arr.some(t=>t.result==='win'||t.result==='loss')?fmt(winrate(arr),0)+'%':'—';
+  const expT=arr=>arr.length?fmtR(expectancy(arr)):'—';
+  const pfT=arr=>{ if(!arr.length) return '—'; const p=profitFactor(arr); return p===Infinity?'∞':fmt(p,2); };
+  const mfeT=arr=>{ const m=arr.filter(t=>t.mfe!=null&&!isNaN(t.mfe)).map(t=>Math.max(0,t.mfe)); return m.length?fmt(m.reduce((a,b)=>a+b,0)/m.length,2)+'R':'—'; };
+  const head=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <div class="section-title" style="margin:0">Trades simulados 🧪</div>
+      <button class="btn primary sm" onclick="openSimModal()">+ Simulado</button>
+    </div>
+    <div class="insight" style="margin-bottom:14px">Apunta aquí los setups que <b>habrías tomado</b> pero no operas (por ejemplo retrocesos, mientras validas si te compensan), con el resultado que habrían tenido siguiendo tu plan. No cuentan en tus estadísticas reales, cuentas, calendario ni ROI. Sirve para saber si un tipo de entrada o una sesión tiene ventaja <b>antes</b> de arriesgar dinero.</div>`;
+  if(!S.length){
+    v.innerHTML=head+`<div class="empty"><div class="ico">🧪</div><p class="hint">Aún no tienes trades simulados. Pulsa <b>+ Simulado</b> y apunta el próximo retroceso que veas: fecha, checklist, R planificado, cómo habría acabado, MFE y MAE.</p><button class="btn primary" style="margin-top:14px" onclick="openSimModal()">+ Simulado</button></div>`;
+    return;
+  }
+  const sNY=S.filter(t=>t.entryType==='retroceso'), rNY=R.filter(t=>t.entryType==='retroceso');
+  const rows=[
+    ['Simulados (todos)',S],['Simulados retroceso',sNY],['Reales retroceso',rNY],['Reales (todos)',R]
+  ];
+  const o=optimalRR(S);
+  const withPlan=S.filter(t=>t.planChecked!=null);
+  const full=withPlan.filter(t=>planComplete(t)), partial=withPlan.filter(t=>!planComplete(t));
+  const dol=S.filter(t=>(t.dolReached==='yes'||t.dolReached==='no')&&t.result!=='loss');
+  const sess=sessionMfeMae(S).filter(r=>r.n);
+  // veredicto retrocesos
+  let verdict='';
+  if(sNY.length){
+    const eS=expectancy(sNY), eR=rNY.length?expectancy(rNY):null;
+    const few=sNY.length<20;
+    verdict=`<div class="insight ${eS>0?'':'warn'}" style="margin-top:12px">
+      En retrocesos simulados llevas <b>${sNY.length} trades</b> con expectancy <b>${fmtR(eS)}</b>${eR!=null?` (en retrocesos reales: ${fmtR(eR)} en ${rNY.length} trades)`:''}.
+      ${few?` ⚠ Aún son pocos: espera a tener <b>20-30 retrocesos simulados</b> antes de decidir si los operas en real.`
+        : eS>0.15?' Con esta muestra, los retrocesos muestran ventaja siguiendo tu plan. Si la diferencia con tus retrocesos reales es grande, el problema en real es la ejecución, no el setup.'
+        : eS>0?' Ventaja pequeña: positivo, pero ajustado. Sigue acumulando antes de arriesgar dinero.'
+        : ' Ni siguiendo el plan sale positivo: de momento los retrocesos no compensan. Céntrate en los impulsos.'}
+    </div>`;
+  }
+  v.innerHTML=head+`
+    <div class="grid g-4" style="margin-bottom:14px">
+      ${statCard('Simulados', S.length, sNY.length+' retrocesos')}
+      ${statCard('Expectancy', expT(S), 'por trade simulado', cls(expectancy(S)))}
+      ${statCard('Win rate', wrT(S), 'sin contar BE')}
+      ${statCard('Profit factor', pfT(S), 'R total '+fmtR(totalR(S)))}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Simulado vs real</h3>
+      <div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th></th><th>N</th><th>Exp</th><th>WR</th><th>PF</th><th>R total</th><th>MFE medio</th></tr></thead>
+        <tbody>${rows.map(([k,a])=>`<tr>
+          <td style="font-family:var(--sans);font-weight:600">${k}</td>
+          <td>${a.length}</td>
+          <td class="${a.length?cls(expectancy(a)):''}">${expT(a)}</td>
+          <td>${wrT(a)}</td>
+          <td>${pfT(a)}</td>
+          <td class="${a.length?cls(totalR(a)):''}">${a.length?fmtR(totalR(a)):'—'}</td>
+          <td>${mfeT(a)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+      ${verdict}
+    </div>
+    <div class="grid g-2" style="margin-bottom:14px">
+      <div class="card">
+        <h3>TP y objetivo final en simulados</h3>
+        ${o.enough?`<div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">R:R ÓPTIMO (SEGÚN MFE)</div><div class="big pos">1:${fmtTP(o.best.tp)}</div><div class="hint" style="margin-top:4px">exp ${fmtR(o.best.exp)} · TP alcanzado ${fmt(o.best.wr,0)}% · ${o.n} con MFE</div></div>`:`<p class="hint">Necesitas 5+ simulados con MFE para el R:R óptimo (llevas ${o.n}).</p>`}
+        <div class="hint" style="margin-top:10px">${dol.length?`Llega al objetivo final: <b>${fmt(dol.filter(t=>t.dolReached==='yes').length/dol.length*100,0)}%</b> (${dol.length} no perdedores con dato) · `:''}MFE medio: <b>${mfeT(S)}</b>${o.avgDol!=null?` · objetivo final medio ${fmt(o.avgDol,2)}R`:''}</div>
+      </div>
+      <div class="card">
+        <h3>¿Habrías seguido el plan?</h3>
+        <div class="hint">Plan completo: <b>${full.length}</b> (exp ${expT(full)}, WR ${wrT(full)})</div>
+        <div class="hint" style="margin-top:4px">Plan incompleto: <b>${partial.length}</b> (exp ${expT(partial)}, WR ${wrT(partial)})</div>
+        <div class="hint" style="margin-top:10px">Apunta también los setups que no cumplen todo el checklist: así ves si respetar el plan marca la diferencia en esa sesión.</div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Por sesión y setup</h3>
+      <div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th>Sesión</th><th>N</th><th>Exp</th><th>MFE medio</th><th>MAE ganadores</th><th>R:R óptimo</th></tr></thead>
+        <tbody>${sess.map(r=>`<tr>
+          <td style="font-family:var(--sans);font-weight:600">${r.session}</td>
+          <td>${r.n}</td>
+          <td class="${cls(r.exp)}">${fmtR(r.exp)}</td>
+          <td>${r.mfe==null?'—':fmt(r.mfe,2)+'R'}</td>
+          <td>${r.maeW==null?'—':fmt(r.maeW,2)+'R'}</td>
+          <td>${r.opt?'1:'+fmtTP(r.opt.tp)+' ('+fmtR(r.opt.exp)+')':'<span class="hint">&lt;5 con MFE</span>'}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+      <div style="margin-top:12px">${breakdownTable(breakdown(S,'setup'))}</div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Lista de simulados</h3>
+      ${tradeDrillList(S.map(t=>({t,tag:t.result==='win'?'ganador':t.result==='loss'?'perdedor':'BE',tone:t.result==='win'?'ok':t.result==='loss'?'bad':'neutral'})),{open:true,fn:'editSim',label:'Simulados'})}
+    </div>
+  `;
+}
+
+function renderPerformance(v, T){
+  v.innerHTML=`
+    <div class="section-title">Rendimiento</div>
+    <div class="grid g-4" style="margin-bottom:14px">
+      ${statCard('Expectancy', fmtR(expectancy(T)),'por trade',cls(expectancy(T)))}
+      ${statCard('Avg win', fmtR(avgWin(T)),'',('pos'))}
+      ${statCard('Avg loss', fmtR(avgLoss(T)),'',('neg'))}
+      ${statCard('Profit factor', profitFactor(T)===Infinity?'∞':fmt(profitFactor(T),2),'',cls(profitFactor(T)-1))}
+    </div>
+    <div class="grid g-2" style="margin-bottom:14px">
+      <div class="card"><h3>Por sesión</h3>${breakdownTable(breakdown(T,'session'))}</div>
+      <div class="card"><h3>Por símbolo</h3>${breakdownTable(breakdown(T,'symbol'))}</div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Por setup</h3>${breakdownTable(breakdown(T,'setup'))}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Tu estrategia por partes ${helpIcon("movetype")}</h3>
+      ${strategyBreakdowns(T)}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Tu R:R óptimo (según MFE) ${helpIcon("optimalrr")}</h3>
+      ${(()=>{
+        const o=optimalRR(T);
+        if(!o.enough) return `<p class="hint">Necesitas al menos 5 trades con MFE registrado para calcular tu R:R óptimo. Llevas ${o.n}. El MFE (R máximo alcanzado) es lo que permite simular cada nivel de TP.</p>`;
+        return `
+        <div class="grid g-2" style="gap:10px;margin-bottom:14px">
+          <div class="calc-out" style="border-color:var(--green-dim)">
+            <div class="label" style="font-size:11px;color:var(--green);font-weight:600;margin-bottom:6px">R:R ÓPTIMO 👑</div>
+            <div class="big pos">1:${fmtTP(o.best.tp)}</div>
+            <div class="hint" style="margin-top:6px">Exp ${fmtR(o.best.exp)} · alcanzado ${fmt(o.best.wr,0)}% de las veces</div>
+          </div>
+          <div class="calc-out">
+            <div class="label" style="font-size:11px;color:var(--ink-dim);font-weight:600;margin-bottom:6px">TU OBJETIVO FINAL MEDIO</div>
+            <div class="big" style="color:var(--blue)">${o.avgDol!=null?'1:'+fmt(o.avgDol,1).replace('.0',''):'—'}</div>
+            <div class="hint" style="margin-top:6px">${o.avgDol!=null?'media real de tu objetivo final ('+o.dolN+' trades)':'registra "Objetivo final en R" en tus trades'}</div>
+          </div>
+        </div>
+        <div style="position:relative;height:220px"><canvas id="rrChart"></canvas></div>
+        <div class="legend"><span><span class="dot" style="background:var(--green)"></span>Expectancy por R:R</span>${o.avgDol!=null?'<span><span class="dot" style="background:var(--blue)"></span>Tu objetivo final medio</span>':''}</div>
+        ${(()=>{
+          if(o.avgDol==null) return `<div class="insight" style="margin-top:12px">Registra "Objetivo final en R" en tus trades (a cuántos R está la zona) para ver si tu R:R óptimo cae antes, en, o después de tu objetivo final.</div>`;
+          const diff=o.best.tp-o.avgDol;
+          if(Math.abs(diff)<=0.25) return `<div class="insight" style="margin-top:12px">Tu R:R óptimo (1:${fmtTP(o.best.tp)}) coincide casi con tu objetivo final medio (1:${fmt(o.avgDol,1).replace('.0','')}). <b>Tu estructura es correcta</b>: el objetivo final es exactamente donde más rentabilidad sacas.</div>`;
+          if(diff<0) return `<div class="insight warn" style="margin-top:12px">Tu R:R óptimo (1:${fmtTP(o.best.tp)}) cae <b>antes</b> de tu objetivo final medio (1:${fmt(o.avgDol,1).replace('.0','')}). El precio no siempre llega al objetivo final, así que cerrar un poco antes te daría más rentabilidad a la larga. Plantéate asegurar antes del objetivo final.</div>`;
+          return `<div class="insight" style="margin-top:12px">Tu R:R óptimo (1:${fmtTP(o.best.tp)}) cae <b>más allá</b> de tu objetivo final medio (1:${fmt(o.avgDol,1).replace('.0','')}). Cuando el precio pasa del objetivo final suele seguir bastante — pero ojo, quizá son pocos casos. Míralo con cuidado.</div>`;
+        })()}
+        <div class="hint" style="margin-top:8px">Basado en ${o.n} trades con MFE. Para cada TP: si tu MFE llegó → +TP; si no llegó y el precio tocó el SL (stop o MAE ≥ 1R) → -1R; si no llegó a ninguno de los dos (BE, cierre manual) → 0R.</div>
+        `;
+      })()}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Análisis de cierres manuales ${helpIcon("manualclose")}</h3>
+      ${(()=>{
+        const manual=T.filter(t=>t.exitType==='manual');
+        if(manual.length<2) return `<p class="hint">Llevas ${manual.length} cierre(s) manual(es). Con 2 o más te muestro el análisis. Marca el flag correspondiente (miedo, FOMO...) si el cierre no siguió tu plan, y registra el MFE.</p>`;
+
+        // Todos los cierres manuales que no acabaron en stop (ganadores Y cerrados a 0R)
+        const manualWins=manual.filter(t=>(t.realizedR||0)>=0);
+        const withMfe=manualWins.filter(t=>!isNaN(t.mfe)&&t.mfe!=null);
+
+        // El FLAG manda: tú decides si el cierre fue limpio o un error.
+        // clean = seguiste tu plan (decisión buena, la respetamos)
+        // dirty = marcaste algún error (miedo, FOMO...) -> ahí sí analizamos el coste
+        let cleanCount=0, cleanReachedTP=0;   // limpios (info neutra)
+        let errCount=0, errCostR=0, errCost$=0, errReachedTP=0;  // con error marcado
+        withMfe.forEach(t=>{
+          const hasError=(t.flags||[]).some(f=>f!=='clean');
+          const reachedTP = t.mfe >= (t.plannedR||0);
+          const leftR = Math.max(0,(t.plannedR||0)-(t.realizedR||0));
+          if(hasError){
+            errCount++;
+            if(reachedTP){ errReachedTP++; errCostR+=leftR; errCost$+=leftR*(t.riskUSD||0); }
+          } else {
+            cleanCount++;
+            if(reachedTP) cleanReachedTP++;
+          }
+        });
+        return `
+        <div class="grid g-3" style="gap:10px">
+          <div class="calc-out" style="border-color:var(--green-dim)"><div class="label" style="font-size:10px;color:var(--green);font-weight:600">CIERRES LIMPIOS</div><div class="big pos">${cleanCount}</div><div class="hint" style="margin-top:4px">seguiste tu plan</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">CON ERROR MARCADO</div><div class="big ${errCount?'neg':''}">${errCount}</div><div class="hint" style="margin-top:4px">miedo, FOMO...</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">R PERDIDO (errores)</div><div class="big ${errCostR>0?'neg':''}">${errCostR>0?'-'+fmt(errCostR,1)+'R':'—'}</div><div class="hint" style="margin-top:4px">${errCostR>0?fmt$(errCost$):'ninguno'}</div></div>
+        </div>
+        ${!withMfe.length?`<div class="insight" style="margin-top:14px">Registra el <b>MFE</b> en tus cierres manuales para el análisis completo.</div>`:`
+          ${cleanCount?`<div class="insight" style="margin-top:14px"><b>${cleanCount} cierre(s) limpio(s).</b> Seguiste tu plan, así que fueron buenas decisiones — el resultado no cambia eso.${cleanReachedTP?` Como dato neutro: en ${cleanReachedTP} de ellos el precio siguió hasta tu TP. No es un error (decidiste bien), pero si ves un patrón, quizá tu plan de salida se pueda afinar.`:` En ninguno el precio siguió hasta tu TP: cerraste justo a tiempo.`}</div>`:''}
+          ${errCount?`<div class="insight ${errReachedTP?'bad':'warn'}" style="margin-top:10px"><b>${errCount} cierre(s) con error marcado.</b> ${errReachedTP?`En ${errReachedTP} el precio llegó a tu TP: te costaron ${fmt(errCostR,1)}R (${fmt$(errCost$)}) por no seguir el plan.`:`El precio no llegó al TP, pero tú marcaste que la decisión no fue limpia — trabájalo igual, el resultado fue suerte.`}</div>`:`<div class="insight" style="margin-top:10px">Ningún cierre manual marcado como error. Todos siguieron tu plan. 🎯</div>`}
+        `}
+        ${(()=>{
+          // Lista de los cierres manuales analizados: primero los que costaron dinero
+          const items=manualWins.map(t=>{
+            const err=(t.flags||[]).some(f=>f!=='clean');
+            const hasMfe=t.mfe!=null&&!isNaN(t.mfe);
+            const reached=hasMfe&&t.mfe>=(t.plannedR||0);
+            const left=Math.max(0,(t.plannedR||0)-(t.realizedR||0));
+            if(!hasMfe) return {t,tag:'sin MFE',tone:'neutral',o:4};
+            if(err&&reached) return {t,tag:`con error · llegó a TP · -${fmt(left,2)}R`,tone:'bad',o:0};
+            if(err) return {t,tag:'con error',tone:'warn',o:1};
+            if(reached) return {t,tag:'limpio · llegó a TP',tone:'neutral',o:2};
+            return {t,tag:'limpio',tone:'ok',o:3};
+          }).sort((a,b)=>a.o-b.o || (a.t.date<b.t.date?1:-1));
+          return tradeDrillList(items);
+        })()}
+        `;
+      })()}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>MFE y MAE por sesión ${helpIcon("sessionmfe")}</h3>
+      ${(()=>{
+        const rows=sessionMfeMae(T).filter(r=>r.nMfe||r.nMaeW||r.nMaeL);
+        if(!rows.length) return `<p class="hint">Registra MFE y MAE en tus trades para ver cómo se mueve el precio en cada sesión.</p>`;
+        const r2=x=>x==null?'—':fmt(x,2)+'R';
+        const withOpt=rows.filter(r=>r.opt);
+        const best=withOpt.length>=2?[...withOpt].sort((a,b)=>b.opt.exp-a.opt.exp)[0]:null;
+        const worst=withOpt.length>=2?[...withOpt].sort((a,b)=>a.opt.exp-b.opt.exp)[0]:null;
+        const small=rows.filter(r=>r.nMfe>0&&r.nMfe<10);
+        return `<div class="table-wrap" style="border:none"><table>
+          <thead><tr><th>Sesión</th><th>N</th><th>MFE medio</th><th>MAE ganadores</th><th>MAE perdedores</th><th>Llega al objetivo final</th><th>R:R óptimo</th></tr></thead>
+          <tbody>${rows.map(r=>`<tr>
+            <td style="font-family:var(--sans);font-weight:600">${r.session}</td>
+            <td>${r.n}</td>
+            <td>${r2(r.mfe)} <span class="hint">(${r.nMfe})</span></td>
+            <td>${r2(r.maeW)}${r.maeWmax!=null?` <span class="hint">máx ${fmt(r.maeWmax,2)}</span>`:''}</td>
+            <td>${r2(r.maeL)}</td>
+            <td>${r.dolPct==null?'—':fmt(r.dolPct,0)+'% <span class="hint">('+r.nDol+')</span>'}</td>
+            <td>${r.opt?`<b>1:${fmtTP(r.opt.tp)}</b> <span class="${cls(r.opt.exp)}">${fmtR(r.opt.exp)}</span>`:'<span class="hint">&lt;5 con MFE</span>'}</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+        ${best&&worst&&best.session!==worst.session?`<div class="insight" style="margin-top:12px">Donde mejor se mueve el precio para ti es <b>${best.session}</b>: con TP en 1:${fmtTP(best.opt.tp)} sacarías ${fmtR(best.opt.exp)} por trade. En <b>${worst.session}</b> el mejor TP posible solo da ${fmtR(worst.opt.exp)}. Si en una sesión el MFE medio es menor, ajusta allí el TP o sé más selectivo.</div>`:''}
+        ${small.length?`<div class="hint" style="margin-top:8px">⚠ Pocos datos en ${small.map(r=>r.session+' ('+r.nMfe+')').join(', ')}: tómalo como orientativo hasta tener 10-15 trades con MFE por sesión.</div>`:''}
+        <div class="hint" style="margin-top:6px">Entre paréntesis, cuántos trades tienen el dato. MAE siempre en positivo. El R:R óptimo usa el mismo método que la tarjeta general (necesita 5+ trades con MFE).</div>`;
+      })()}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>¿Está tu SL demasiado lejos? (MAE) ${helpIcon("maeanalysis")}</h3>
+      ${(()=>{
+        // MAE siempre en positivo (si se anotó -1 por error, cuenta como 1)
+        const withMae=T.filter(t=>!isNaN(t.mae)&&t.mae!=null).map(t=>({...t,mae:Math.abs(t.mae)}));
+        if(withMae.length<5) return `<p class="hint">Registra el MAE (R máximo en contra) en tus trades. Con 5+ te muestro si tu SL está demasiado lejos. Fiable de verdad a partir de 20-30 trades.</p>`;
+        const wins=withMae.filter(t=>t.result==='win');
+        const losses=withMae.filter(t=>t.result==='loss');
+        const avg=arr=>arr.length?arr.reduce((s,t)=>s+t.mae,0)/arr.length:0;
+        const max=arr=>arr.length?Math.max(...arr.map(t=>t.mae)):0;
+        const avgWinMae=avg(wins), maxWinMae=max(wins);
+        const avgLossMae=avg(losses);
+        // percentil 90 del MAE de ganadores: el stop que respetaría el 90% de tus ganadores
+        const winMaes=wins.map(t=>t.mae).sort((a,b)=>a-b);
+        const p90=winMaes.length?winMaes[Math.min(winMaes.length-1,Math.floor(winMaes.length*0.9))]:0;
+        return `
+        <div class="grid g-3" style="gap:10px">
+          <div class="calc-out" style="border-color:var(--green-dim)"><div class="label" style="font-size:10px;color:var(--green);font-weight:600">MAE MEDIO GANADORES</div><div class="big pos">${fmt(avgWinMae,2)}R</div><div class="hint" style="margin-top:4px">cuánto sufren antes de ganar</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">PEOR MAE GANADOR</div><div class="big">${fmt(maxWinMae,2)}R</div><div class="hint" style="margin-top:4px">el que más aguantó</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">MAE MEDIO PERDEDORES</div><div class="big neg">${fmt(avgLossMae,2)}R</div><div class="hint" style="margin-top:4px">${losses.length} SL</div></div>
+        </div>
+        <div class="insight ${p90<0.7?'warn':''}" style="margin-top:14px">
+          El <b>90% de tus ganadores</b> no fue más allá de <b>${fmt(p90,2)}R en contra</b> antes de girarse.
+          ${p90<0.7
+            ? ` Tu SL a 1R está probablemente <b>demasiado lejos</b>: podrías ajustarlo a ~${fmt(Math.min(1,p90+0.15),1)}R y arriesgar menos sin perder casi ganadores. Eso mejoraría tu R:R en cada trade.`
+            : ` Tu SL parece bien ajustado — tus ganadores usan buena parte del margen antes de girarse, así que recortarlo te sacaría de trades buenos.`}
+        </div>
+        <div class="insight" style="margin-top:10px"><b>Ojo con los barridos:</b> ${maxWinMae>=0.85
+          ? `tu peor ganador aguantó ${fmt(maxWinMae,2)}R en contra. Si ajustas el SL por debajo de eso, te comerías ese tipo de barridos de liquidez. No bajes del ${fmt(maxWinMae,1)}R sin pensarlo.`
+          : `ninguno de tus ganadores necesitó más de ${fmt(maxWinMae,2)}R de margen, así que tienes espacio para ajustar sin comerte manipulaciones grandes.`}</div>
+        <div class="hint" style="margin-top:8px">Basado en ${withMae.length} trades con MAE (${wins.length} ganadores, ${losses.length} perdedores). ${withMae.length<20?'⚠ Pocos datos: no saques conclusiones firmes hasta tener 20-30 trades.':''}</div>
+        `;
+      })()}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Análisis de break-even (BE) ${helpIcon("beanalysis")}</h3>
+      ${(()=>{
+        const be=T.filter(t=>t.exitType==='be_moved');
+        if(!be.length) return `<p class="hint">Aún no tienes salidas marcadas como "Movió BE y saltó". Cuando las registres (con su MFE), te muestro si mueves el BE bien o por impulso, y cuántos habrían ido a TP.</p>`;
+        // bien puesto = sin flags de impulso (siguió el plan: BE solo tras primer objetivo)
+        // mal puesto = con moved_stop o early_close (lo movió por miedo/fuera de plan)
+        const badFlags=t=>(t.flags||[]).some(f=>f==='moved_stop'||f==='early_close'||f==='fomo');
+        const wellPlaced=be.filter(t=>!badFlags(t));
+        const impulsive=be.filter(t=>badFlags(t));
+        // de los BE, cuántos habrían ido a TP (MFE >= plannedR)
+        const withMfe=be.filter(t=>!isNaN(t.mfe)&&t.mfe!=null);
+        const wouldveTP=withMfe.filter(t=>t.mfe>=(t.plannedR||0));
+        const lostR=wouldveTP.reduce((s,t)=>s+(t.plannedR||0),0);
+        const lost$=wouldveTP.reduce((s,t)=>s+(t.plannedR||0)*(t.riskUSD||0),0);
+        // cruce: de los que habrían ido a TP, cuántos por impulso vs por plan
+        const tpByImpulse=wouldveTP.filter(t=>badFlags(t)).length;
+        const tpByPlan=wouldveTP.filter(t=>!badFlags(t)).length;
+        return `
+        <div class="grid g-4" style="gap:10px">
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">TOTAL BE</div><div class="big">${be.length}</div></div>
+          <div class="calc-out" style="border-color:var(--green-dim)"><div class="label" style="font-size:10px;color:var(--green);font-weight:600">BIEN PUESTOS</div><div class="big pos">${wellPlaced.length}</div><div class="hint" style="margin-top:4px">según plan</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">POR IMPULSO</div><div class="big ${impulsive.length?'neg':''}">${impulsive.length}</div><div class="hint" style="margin-top:4px">miedo / fuera de plan</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">HABRÍAN IDO A TP</div><div class="big ${wouldveTP.length?'neg':''}">${wouldveTP.length}</div><div class="hint" style="margin-top:4px">${withMfe.length?'de '+withMfe.length+' con MFE':'registra MFE'}</div></div>
+        </div>
+        ${impulsive.length?`<div class="insight warn" style="margin-top:14px"><b>${impulsive.length} de ${be.length} BE los moviste por impulso</b> (miedo o fuera de plan). Revisa si te estás adelantando por miedo.</div>`:`<div class="insight" style="margin-top:14px">Todos tus BE los pusiste siguiendo el plan. 🎯</div>`}
+        ${wouldveTP.length?`<div class="insight bad" style="margin-top:10px"><b>${wouldveTP.length} BE que habrían ido a TP.</b> El precio te sacó en 0R y luego llegó a tu objetivo: dejaste de ganar ${fmt(lostR,1)}R (${fmt$(lost$)}).</div>
+        <div class="insight ${tpByImpulse>tpByPlan?'bad':'warn'}" style="margin-top:10px"><b>El cruce clave:</b> de esos ${wouldveTP.length} ganadores perdidos, <b>${tpByImpulse} fueron por impulso</b> (miedo) y <b>${tpByPlan} por plan</b>. ${tpByImpulse>tpByPlan
+          ? 'La mayoría los perdiste por mover el BE con miedo, no por estrategia. Es un problema de DISCIPLINA: si aguantas tu plan, recuperas esos ganadores.'
+          : tpByPlan>tpByImpulse
+          ? 'La mayoría los perdiste siguiendo tu plan. No es miedo — es tu REGLA de BE la que es demasiado ajustada. Plantéate mover el BE más tarde o a un nivel con más margen.'
+          : 'Están repartidos entre impulso y plan. Ataca las dos cosas: más disciplina para no adelantarte, y revisa si tu nivel de BE es muy ajustado.'}</div>`:withMfe.length?`<div class="insight" style="margin-top:10px">Ninguno de tus BE habría llegado a TP. Moviste bien: el precio no iba a seguir. 👍</div>`:''}
+        ${(()=>{
+          // Lista de los BE: primero los que habrían ido a TP
+          const items=be.map(t=>{
+            const imp=badFlags(t);
+            const hasMfe=t.mfe!=null&&!isNaN(t.mfe);
+            const tp=hasMfe&&t.mfe>=(t.plannedR||0);
+            if(tp&&imp) return {t,tag:`por impulso · habría ido a TP (${fmt(t.plannedR||0,2)}R)`,tone:'bad',o:0};
+            if(tp) return {t,tag:`según plan · habría ido a TP (${fmt(t.plannedR||0,2)}R)`,tone:'bad',o:1};
+            if(imp) return {t,tag:'por impulso',tone:'warn',o:2};
+            if(!hasMfe) return {t,tag:'sin MFE',tone:'neutral',o:4};
+            return {t,tag:'según plan',tone:'ok',o:3};
+          }).sort((a,b)=>a.o-b.o || (a.t.date<b.t.date?1:-1));
+          return tradeDrillList(items);
+        })()}
+        `;
+      })()}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>¿Llega el precio a tu objetivo final? ${helpIcon("dolreach")}</h3>
+      ${(()=>{
+        // Els SL s'exclouen: un stop mai arriba al objetivo final, comptar-los distorsiona el %
+        const withDol=T.filter(t=>(t.dolReached==='yes'||t.dolReached==='no') && t.result!=='loss');
+        const withMfe=T.filter(t=>!isNaN(t.mfe)&&t.mfe!=null);
+        if(withDol.length<3 && withMfe.length<3) return `<p class="hint">Registra "¿Llegó al objetivo final?" y el R máximo (MFE) en tus trades. Con 3+ te muestro si el precio suele llegar a tu objetivo final o se queda en objetivos intermedios.</p>`;
+        const reached=withDol.filter(t=>t.dolReached==='yes').length;
+        const dolPct=withDol.length?reached/withDol.length*100:0;
+        const avgMfe=withMfe.length?withMfe.reduce((s,t)=>s+t.mfe,0)/withMfe.length:0;
+        // MFE medio cuando NO llegó al objetivo final: ¿dónde se suele quedar?
+        const noReach=withMfe.filter(t=>t.dolReached==='no');
+        const avgMfeNoReach=noReach.length?noReach.reduce((s,t)=>s+t.mfe,0)/noReach.length:0;
+        return `
+        <div class="grid g-3" style="gap:10px">
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">LLEGA AL OBJETIVO FINAL</div><div class="big ${dolPct>=50?'pos':'neg'}">${fmt(dolPct,0)}%</div><div class="hint" style="margin-top:4px">${reached}/${withDol.length} trades</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">MFE MEDIO</div><div class="big">${fmt(avgMfe,1)}R</div><div class="hint" style="margin-top:4px">hasta dónde llega el precio</div></div>
+          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">SE QUEDA EN (si no llega)</div><div class="big">${noReach.length?fmt(avgMfeNoReach,1)+'R':'—'}</div><div class="hint" style="margin-top:4px">objetivo intermedio típico</div></div>
+        </div>
+        <div class="insight ${dolPct>=50?'':'warn'}" style="margin-top:14px">${dolPct>=50
+          ? `De los trades que no acabaron en stop, el precio llega a tu objetivo final el <b>${fmt(dolPct,0)}%</b> de las veces. Aguantar hasta el objetivo final te compensa — tu paciencia tiene premio.`
+          : `De los trades que no acabaron en stop, el precio solo llega al objetivo final el <b>${fmt(dolPct,0)}%</b> de las veces. ${noReach.length?`Cuando no llega, suele quedarse sobre ${fmt(avgMfeNoReach,1)}R.`:''} Tu plan ya lo dice: prioriza asegurar el 1:2 en vez de esperar siempre a la zona.`}</div>
+        <div class="hint" style="margin-top:8px">Basado en ${withDol.length} trades no perdedores con objetivo final registrado y ${withMfe.length} con MFE. Los SL se excluyen del % (nunca llegan al objetivo final), pero su MFE sí cuenta.</div>
+        `;
+      })()}
+    </div>
+    <div class="card">
+      <h3>Cuántos trades caen en cada rango de R ${helpIcon("distribution")}</h3>
+      <div style="position:relative;height:200px"><canvas id="distChart"></canvas></div>
+    </div>
+
+    <div class="grid g-2" style="margin-top:14px;margin-bottom:14px">
+      <div class="card">
+        <h3>Rachas ${helpIcon("streaks")}</h3>
+        ${(()=>{
+          const s=streaks(T);
+          const curLabel = s.curType==='win'?`${s.curCount} victoria${s.curCount>1?'s':''} 🔥`:s.curType==='loss'?`${s.curCount} derrota${s.curCount>1?'s':''}`:'—';
+          return `<div class="grid g-3" style="gap:10px">
+            <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">RACHA ACTUAL</div><div class="big ${s.curType==='win'?'pos':s.curType==='loss'?'neg':''}">${curLabel}</div></div>
+            <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">RÉCORD VICTORIAS</div><div class="big pos">${s.maxWin}</div></div>
+            <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">RÉCORD DERROTAS</div><div class="big neg">${s.maxLoss}</div></div>
+          </div>
+          ${s.maxLoss>0?`<div class="insight" style="margin-top:14px">Tu peor racha histórica fueron <b>${s.maxLoss} derrotas seguidas</b>. Tenerlo presente ayuda: cuando encadenes pérdidas, sabrás que ya lo has superado antes sin que te hundiera.</div>`:''}`;
+        })()}
+      </div>
+      <div class="card">
+        <h3>Día de la semana + disciplina ${helpIcon("daydisc")}</h3>
+        ${(()=>{
+          const rows=dayDisciplineBreakdown(T);
+          if(!rows.length) return '<p class="hint">Sin datos suficientes.</p>';
+          const best=[...rows].sort((a,b)=>b.exp-a.exp)[0];
+          const worst=[...rows].sort((a,b)=>a.exp-b.exp)[0];
+          return `<div class="table-wrap" style="border:none"><table style="min-width:auto">
+            <thead><tr><th>Día</th><th>N</th><th>Exp</th><th>WR</th><th>% error</th></tr></thead>
+            <tbody>${rows.map(r=>`<tr>
+              <td style="font-family:var(--sans);font-weight:600">${r.key}</td>
+              <td>${r.n}</td>
+              <td class="${cls(r.exp)}">${fmtR(r.exp)}</td>
+              <td>${fmt(r.wr,0)}%</td>
+              <td class="${r.errRate>30?'neg':r.errRate>0?'':'pos'}">${fmt(r.errRate,0)}%</td>
+            </tr>`).join('')}</tbody>
+          </table></div>
+          ${rows.length>=2?`<div class="insight" style="margin-top:12px">Mejor día: <b>${best.key}</b> (${fmtR(best.exp)}). Peor: <b>${worst.key}</b> (${fmtR(worst.exp)}${worst.errRate>30?`, con ${fmt(worst.errRate,0)}% de trades con error`:''}). ${worst.errRate>30?'Si el peor día coincide con más errores, quizá el problema eres tú ese día, no el mercado.':''}</div>`:''}`;
+        })()}
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Rendimiento por mes ${helpIcon("bymonth")}</h3>
+      ${(()=>{
+        const rows=monthBreakdown(T);
+        if(!rows.length) return '<p class="hint">Sin datos suficientes.</p>';
+        const best=[...rows].sort((a,b)=>b.exp-a.exp)[0];
+        const worst=[...rows].sort((a,b)=>a.exp-b.exp)[0];
+        return `<div class="table-wrap" style="border:none"><table style="min-width:auto">
+          <thead><tr><th>Mes</th><th>N</th><th>Exp</th><th>WR</th><th>R acum</th><th>% error</th></tr></thead>
+          <tbody>${rows.map(r=>`<tr>
+            <td style="font-family:var(--sans);font-weight:600">${r.key}</td>
+            <td>${r.n}</td>
+            <td class="${cls(r.exp)}">${fmtR(r.exp)}</td>
+            <td>${fmt(r.wr,0)}%</td>
+            <td class="${cls(r.r)}">${fmtR(r.r)}</td>
+            <td class="${r.errRate>30?'neg':r.errRate>0?'':'pos'}">${fmt(r.errRate,0)}%</td>
+          </tr>`).join('')}</tbody>
+        </table></div>
+        ${rows.length>=2?`<div class="insight" style="margin-top:12px">Mejor mes: <b>${best.key}</b> (${fmtR(best.exp)} de expectancy). Peor: <b>${worst.key}</b> (${fmtR(worst.exp)}). Te ayuda a ver tu evolución y si vas mejorando con el tiempo.</div>`:''}`;
+      })()}
+    </div>
+    ${kellyCard(T)}
+  `;
+  drawDistribution('distChart', T);
+  drawRRCurve('rrChart', T);
+}
+
+/* ============================================================
+   CAPITAL & SIZING
+   ============================================================ */
+function planOptionsHTML(selId){
+  // genera <option> "Firma|Plan|Fase". En sizing solo mostramos cuentas de 50K.
+  let opts='';
+  Object.keys(DB.firms||{}).forEach(firm=>{
+    Object.keys(DB.firms[firm].plans).forEach(plan=>{
+      const p=DB.firms[firm].plans[plan];
+      if((p.size||0)!==50000) return;   // solo 50K
+      ['Evaluación','Funded'].forEach(phase=>{
+        const val=`${firm}|${plan}|${phase}`;
+        opts+=`<option value="${val}">${firm} ${plan} · ${phase}</option>`;
+      });
+    });
+  });
+  if(!opts) opts=`<option value="">— sin cuentas de 50K —</option>`;
+  return opts;
+}
+function selectedSpec(selId){
+  const val=$('#'+selId)?.value||'';
+  const [firm,plan,phase]=val.split('|');
+  return planSpec(firm,plan,phase);
+}
+
+// Kelly como termómetro de edge — se muestra en Rendimiento
+function kellyCard(T){
+  const k = kellyFraction(T);
+  const halfK = k/2, quarterK = k/4;
+  return `
+    <div class="card" style="margin-bottom:14px">
+      <h3>Validación de edge (Kelly) ${helpIcon("kelly")}</h3>
+      <div class="grid g-3">
+        ${statCard('Kelly completo', T.length>=30?fmt(k*100,1)+'%':'n/a', T.length>=30?'no usar directo':'necesitas 30+ trades','neu')}
+        ${statCard('½ Kelly', T.length>=30?fmt(halfK*100,1)+'%':'n/a','~75% crecimiento','pos')}
+        ${statCard('¼ Kelly', T.length>=30?fmt(quarterK*100,1)+'%':'n/a','mínima varianza','neu')}
+      </div>
+      <div class="insight" style="margin-top:14px">Kelly aquí es solo un termómetro de tu edge, no tu sizing. ${k>0?`Tu edge es positivo (Kelly ${fmt(k*100,1)}%), lo que valida arriesgar fijo por trade.`:`Kelly ≤ 0 o sin datos: aún no hay edge demostrado para subir tamaño.`}</div>
+    </div>`;
+}
+/* ============================================================
+   ACCOUNTS & PAYOUTS
+   ============================================================ */
+// Detecta cuentas que han llegado al target (eval) o tocado el MLL, y avisa para cambiar de estado.
+// Solo avanza estados, respeta los marcados manualmente ('payout', 'perdida' no se tocan).
+let _autoAsked=new Set(); // en memoria: no repreguntar en la misma sesión si el usuario dijo que no
+function checkAccountAutoStatus(){
+  const T=DB.trades;
+  let changed=false;
+  (DB.accounts||[]).forEach(a=>{
+    const st=a.status||'en_curso';
+    // no tocar cuentas ya en un estado final marcado por el usuario
+    if(st==='payout'||st==='perdida') return;
+    const spec=planSpec(a.firm,a.plan,a.phase)||{};
+    const allAcctTrades=T.filter(t=>t.account===a.name);
+    // Para cuentas funded, solo cuentan los trades de fase funded
+    const aTrades = a.phase==='Funded'
+      ? allAcctTrades.filter(t=>tradePhase(t)==='funded')
+      : allAcctTrades;
+    const realized=totalPnl(aTrades);
+    const balance=(a.startBalance||0)+realized;
+    const dd=spec.drawdown||0;
+    const trailLock=spec.trailLock||0, lockedFloor=spec.lockedFloor||0;
+    // Suelo trailing: sube con el pico de balance alcanzado, nunca baja.
+    // Reconstruimos el pico acumulando los trades en orden.
+    const startBal=a.startBalance||0;
+    let running=startBal, peak=startBal;
+    aTrades.slice().sort((x,y)=> x.date<y.date?-1:1).forEach(t=>{ running+=(t.pnl||0); if(running>peak) peak=running; });
+    let floor;
+    if(trailLock && peak>=trailLock) floor=lockedFloor;
+    else floor=peak-dd;
+    // 1) ¿Tocó el MLL? (cualquier cuenta viva) — el balance actual cae por debajo del suelo trailing
+    if(dd && balance<=floor && !_autoAsked.has(a.id+':lost')){
+      _autoAsked.add(a.id+':lost');
+      if(confirm(`La cuenta "${a.name}" ha tocado su límite de pérdida (balance ${fmt$(balance)} ≤ suelo ${fmt$(floor)}).\n\n¿Marcarla como PERDIDA?`)){
+        a.status='perdida'; changed=true;
+      }
+      return;
+    }
+    // 2) ¿Eval que llegó al target?
+    const target=spec.profitTarget||0;
+    if(a.phase==='Evaluación' && target && realized>=target && !_autoAsked.has(a.id+':funded')){
+      _autoAsked.add(a.id+':funded');
+      if(confirm(`La cuenta "${a.name}" ha alcanzado su profit target (${fmt$(realized)} ≥ ${fmt$(target)}).\n\n¿Pasarla a FONDEADA? Se actualizarán sus reglas (nuevo drawdown, sin target) y el balance arrancará limpio en el tamaño base de la cuenta.`)){
+        a.phase='Funded';
+        a.status='fondeada';
+        // La cuenta funded arranca LIMPIA en su tamaño base. Los trades de la eval
+        // no cuentan (eran simulados para pasar). El nuevo spec funded da el tamaño.
+        const fundedSpec=planSpec(a.firm,a.plan,'Funded')||{};
+        a.startBalance = fundedSpec.size || a.size || a.startBalance;
+        changed=true;
+      }
+    }
+  });
+  if(changed) save();
+}
+
+function renderROI(v, T){
+  const accts = DB.accounts;
+  const costs = DB.propCosts||[];
+  const payouts = DB.payouts||[];
+  // ROI global
+  const totalSpent = costs.reduce((s,c)=>s+(c.amount||0),0);
+  const totalCollected = payouts.reduce((s,p)=>s+(p.amount||0),0);
+  const netProfit = totalCollected - totalSpent;
+  const roiPct = totalSpent>0? (netProfit/totalSpent*100) : null;
+  // Embudo por estado de cuenta
+  const byStatus=s=>accts.filter(a=>(a.status||'en_curso')===s).length;
+  const nEval = accts.length; // total cuentas registradas
+  // Una cuenta que llegó a fondeada CUENTA COMO PASADA aunque después se quemara
+  // (antes, al marcarla "perdida", desaparecía de las aprobadas).
+  const reachedFunded = a => a.phase==='Funded' || ['fondeada','payout'].includes(a.status);
+  const nPassed = accts.filter(a=>a.status==='pasada' || reachedFunded(a)).length;
+  const nFunded = accts.filter(reachedFunded).length;
+  const nPayout = byStatus('payout');
+  const nLost = byStatus('perdida');
+  const nInProgress = byStatus('en_curso');
+  // % aprobación sobre evaluaciones YA TERMINADAS (las que siguen en curso aún no han pasado ni fallado)
+  const nEvalDone = accts.filter(a=>(a.status||'en_curso')!=='en_curso' || reachedFunded(a)).length;
+  const passRate = nEvalDone>0? nPassed/nEvalDone*100 : 0;
+  const payoutConv = nFunded>0? nPayout/nFunded*100 : 0;
+  const avgPayout = payouts.length? totalCollected/payouts.length : 0;
+
+  v.innerHTML=`
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
+      <span>ROI de props</span>
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost sm" onclick="openCostModal()">+ Coste</button>
+        <button class="btn ghost sm" onclick="openPayoutModal()">+ Payout</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>ROI global ${helpIcon("roiglobal")}</h3>
+      <div class="grid g-4" style="gap:10px">
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">GASTADO</div><div class="big neg">${fmt$(totalSpent)}</div><div class="hint" style="margin-top:4px">${costs.length} costes</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">COBRADO</div><div class="big pos">${fmt$(totalCollected)}</div><div class="hint" style="margin-top:4px">${payouts.length} payouts</div></div>
+        <div class="calc-out" style="border-color:${netProfit>=0?'var(--green-dim)':'var(--red-dim)'}"><div class="label" style="font-size:10px;color:var(--ink-faint)">NETO</div><div class="big ${cls(netProfit)}">${fmt$(netProfit)}</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">ROI</div><div class="big ${roiPct==null?'':cls(roiPct)}">${roiPct==null?'—':fmt(roiPct,0)+'%'}</div></div>
+      </div>
+      ${roiPct!=null?`<div class="insight ${netProfit>=0?'':'warn'}" style="margin-top:14px">${netProfit>=0
+        ? `Tu negocio de props es rentable: por cada $ invertido en cuentas, recuperas ${fmt(1+roiPct/100,2)}$. `
+        : `De momento vas en negativo: has gastado ${fmt$(totalSpent)} y cobrado ${fmt$(totalCollected)}. Normal al principio si estás construyendo historial. `}</div>`:`<div class="hint" style="margin-top:12px">Añade tus costes de cuentas y tus payouts para ver el ROI.</div>`}
+    </div>
+
+    <div class="card" style="margin-bottom:14px">
+      <h3>Estadística de cuentas ${helpIcon("funnel")}</h3>
+      <div class="grid g-4" style="gap:10px">
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">CUENTAS</div><div class="big">${nEval}</div><div class="hint" style="margin-top:4px">${nInProgress} en curso</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">PASADAS</div><div class="big">${nPassed}</div><div class="hint" style="margin-top:4px">${fmt(passRate,0)}% aprobación (de ${nEvalDone} terminadas)</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">CON PAYOUT</div><div class="big pos">${nPayout}</div><div class="hint" style="margin-top:4px">${fmt(payoutConv,0)}% de las fondeadas</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">PERDIDAS</div><div class="big ${nLost?'neg':''}">${nLost}</div></div>
+      </div>
+      <div class="grid g-2" style="gap:10px;margin-top:10px">
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">PAYOUT MEDIO</div><div class="big">${fmt$(avgPayout)}</div></div>
+        <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">PAYOUT TOTAL</div><div class="big pos">${fmt$(totalCollected)}</div></div>
+      </div>
+      <div class="hint" style="margin-top:12px">La estadística se calcula con el estado de cada cuenta (abajo). Marca el estado de cada una para que salgan bien las tasas de aprobación y conversión.</div>
+    </div>
+
+    ${costs.length||payouts.length?`
+    <div class="card" style="margin-bottom:14px">
+      <h3>Movimientos</h3>
+      <div class="table-wrap" style="border:none"><table>
+        <thead><tr><th>Fecha</th><th>Tipo</th><th>Concepto</th><th>Importe</th><th></th></tr></thead>
+        <tbody>
+        ${[...costs.map(c=>({...c,kind:'coste'})),...payouts.map(p=>({...p,kind:'payout'}))]
+          .sort((a,b)=> a.date<b.date?1:-1)
+          .map(m=>`<tr>
+            <td>${m.date}</td>
+            <td><span class="tag ${m.kind==='payout'?'ok':'bad'}">${m.kind==='payout'?'Payout':'Coste'}</span></td>
+            <td style="font-family:var(--sans)">${m.concept||m.firm||'—'}</td>
+            <td class="${m.kind==='payout'?'pos':'neg'}">${m.kind==='payout'?'+':'−'}${fmt$(m.amount)}</td>
+            <td style="text-align:right"><button class="btn ghost sm icon" onclick="${m.kind==='payout'?`editPayout('${m.id}')`:`editCost('${m.id}')`}" title="Editar">✎</button></td>
+          </tr>`).join('')}
+        </tbody>
+      </table></div>
+    </div>`:''}
+
+    <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-top:20px">
+      <span>Cuentas</span>
+      <button class="btn primary sm" onclick="openAccountModal()">+ Cuenta</button>
+    </div>
+    ${!accts.length?`<div class="empty"><div class="ico">▤</div><p class="hint">Sin cuentas. Añade cada cuenta que compres y ve marcando si la pasas, la fondeas, cobras o la pierdes: con eso salen tu % de aprobación y de payout.</p></div>`:`
+    <div class="card">
+      <div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th>Cuenta</th><th>Firma</th><th>Estado</th><th></th></tr></thead>
+        <tbody>${[...accts].sort((x,y)=>(ACCT_ORDER[x.status||'en_curso']??9)-(ACCT_ORDER[y.status||'en_curso']??9)).map(a=>`<tr style="${a.status==='perdida'?'opacity:.55':''}">
+          <td style="font-family:var(--sans);font-weight:600">${esc(a.name)}</td>
+          <td class="hint" style="font-family:var(--sans)">${esc([a.firm,a.plan].filter(Boolean).join(' '))}</td>
+          <td><select onchange="setAccountStatus('${a.id}',this.value)" style="min-width:130px">
+            ${ACCT_STATUSES.map(([k,l])=>`<option value="${k}" ${(a.status||'en_curso')===k?'selected':''}>${l}</option>`).join('')}
+          </select></td>
+          <td style="text-align:right"><button class="btn ghost sm icon" onclick="editAccount('${a.id}')" title="Editar">✎</button></td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+      <div class="hint" style="margin-top:10px">Cambia el estado cuando pases, fondees, cobres o pierdas una cuenta. Las de arriba (estadística) se calculan con estos estados.</div>
+    </div>`}
+  `;
+}
+const ACCT_STATUSES=[['en_curso','En curso'],['pasada','Pasada'],['fondeada','Fondeada'],['payout','Con payout'],['perdida','Perdida']];
+const ACCT_ORDER={en_curso:0,pasada:1,fondeada:2,payout:3,perdida:4};
+function esc(x){ return String(x==null?'':x).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function setAccountStatus(id,st){
+  const a=DB.accounts.find(x=>x.id===id); if(!a) return;
+  a.status=st;
+  // fondeada / con payout implican que llegó a fondeada
+  if(st==='fondeada'||st==='payout') a.phase='Funded';
+  save(); render(); toast('Estado actualizado');
+}
+
+/* ============================================================
+   CALENDAR
+   ============================================================ */
+let CAL_MONTH = new Date().getMonth();
+let CAL_YEAR = new Date().getFullYear();
+let CAL_VIEW = 'pnl'; // 'pnl' o 'disciplina'
+
+function calShift(delta){
+  CAL_MONTH += delta;
+  if(CAL_MONTH<0){ CAL_MONTH=11; CAL_YEAR--; }
+  if(CAL_MONTH>11){ CAL_MONTH=0; CAL_YEAR++; }
+  render();
+}
+function calSetView(view){ CAL_VIEW=view; render(); }
+
+// Convierte un setup en puntuación numérica (A+=4, A=3, B=2, C=1). Sin setup → null.
+function setupScore(setup){
+  if(!setup) return null;
+  const s=setup.replace('Setup ','').trim();
+  return s==='A+'?4:s==='A'?3:s==='B'?2:s==='C'?1:null;
+}
+// Puntuación de disciplina de UN trade: si tiene cualquier flag de error (miedo, FOMO...) cuenta como C,
+// aunque el checklist diera A+. Si está limpio, manda su setup.
+function tradeDiscScore(t){
+  if((t.flags||[]).some(f=>f!=='clean')) return 1;
+  return setupScore(t.setup);
+}
+const DISC_GREY={score:null,border:'var(--line)',bg:'transparent',chipBg:'rgba(138,151,168,.16)',chipFg:'var(--ink-faint)'};
+// Colores de la vista disciplina según la nota media (inline, no dependen del index.html).
+// Cortes: A+ (≥3.5) verde fuerte, A (2.5–3.5) verde suave, B (1.5–2.5) amarillo, C (<1.5) rojo
+function discStyle(avg){
+  if(avg>=3.5) return {score:avg,label:'A+',border:'#3ddc84',bg:'rgba(61,220,132,.18)',chipBg:'rgba(61,220,132,.28)',chipFg:'#3ddc84'};
+  if(avg>=2.5) return {score:avg,label:'A', border:'rgba(61,220,132,.5)',bg:'rgba(61,220,132,.09)',chipBg:'rgba(61,220,132,.18)',chipFg:'#3ddc84'};
+  if(avg>=1.5) return {score:avg,label:'B', border:'rgba(224,176,64,.6)',bg:'rgba(224,176,64,.1)',chipBg:'rgba(224,176,64,.2)',chipFg:'#e0b040'};
+  return {score:avg,label:'C', border:'rgba(255,90,90,.6)',bg:'rgba(255,90,90,.1)',chipBg:'rgba(255,90,90,.2)',chipFg:'#ff6b6b'};
+}
+// Nota media de un día con trades. Sin setup ni flags → gris (no cuenta).
+function dayDisciplina(trades){
+  const scores=trades.map(tradeDiscScore).filter(s=>s!=null);
+  if(!scores.length) return {...DISC_GREY,label:'SIN SETUP'};
+  return discStyle(scores.reduce((a,b)=>a+b,0)/scores.length);
+}
+// Día sin operar: verde fuerte si seguiste el plan, rojo si no, gris si no está marcado.
+function noTradeDisciplina(nt){
+  if(nt.planFollowed==='yes') return {...discStyle(4),label:'PLAN ✓'};
+  if(nt.planFollowed==='no')  return {...discStyle(1),label:'PLAN ✗'};
+  return {...DISC_GREY,label:'SIN MARCAR'};
+}
+
+function renderCalendar(v, T){
+  const monthName = new Date(CAL_YEAR,CAL_MONTH,1).toLocaleDateString('es-ES',{month:'long',year:'numeric'});
+  const first = new Date(CAL_YEAR,CAL_MONTH,1);
+  const startDow = (first.getDay()+6)%7; // lunes=0
+  const daysInMonth = new Date(CAL_YEAR,CAL_MONTH+1,0).getDate();
+  const todayStr = todayISO();
+
+  // agrupar trades por día del mes visible (parseo local explícito, sin desfase TZ)
+  const byDay={};
+  T.forEach(t=>{
+    const [yy,mm,dd]=t.date.split('-').map(Number);
+    if(yy===CAL_YEAR && (mm-1)===CAL_MONTH){
+      const day=dd;
+      byDay[day]=byDay[day]||{pnl:0,n:0,dirty:false,r:0,phases:new Set(),trades:[]};
+      byDay[day].pnl+=(t.pnl||0);
+      byDay[day].r+=(t.realizedR||0);
+      byDay[day].n++;
+      byDay[day].trades.push(t);
+      if((t.flags||[]).some(f=>f!=='clean')) byDay[day].dirty=true;
+      const ph=tradePhase(t); if(ph) byDay[day].phases.add(ph);
+    }
+  });
+
+  // stats del mes
+  const monthDays=Object.values(byDay);
+  const monthPnl=monthDays.reduce((s,d)=>s+d.pnl,0);
+  const greenDays=monthDays.filter(d=>d.pnl>0).length;
+  const redDays=monthDays.filter(d=>d.pnl<0).length;
+
+  const dows=['Lun','Mar','Mié','Jue','Vie','Sáb','Dom'];
+  let cells='';
+  for(let i=0;i<startDow;i++) cells+=`<div class="cal-cell empty"></div>`;
+  const ntByDate={};
+  (DB.noTradeDays||[]).forEach(n=>{ (ntByDate[n.date]=ntByDate[n.date]||[]).push(n); });
+  for(let day=1;day<=daysInMonth;day++){
+    const d=byDay[day];
+    const dateStr=`${CAL_YEAR}-${String(CAL_MONTH+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+    const isToday=dateStr===todayStr;
+    const ntList=ntByDate[dateStr]||[];
+    const noday=ntList.find(n=>(n.type||'noday')==='noday');
+    const unfilledCount=ntList.filter(n=>n.type==='unfilled').length;
+    if(d){
+      if(CAL_VIEW==='disciplina'){
+        // Vista disciplina: color por setup medio del día (A+ verde fuerte … C rojo). Estilos inline.
+        const disc=dayDisciplina(d.trades);
+        const chips = `<div class="cal-chips">
+          <span class="cal-chip" style="background:${disc.chipBg};color:${disc.chipFg}">${disc.label}</span>
+          ${d.dirty?'<span class="cal-chip err">REGLA SALTADA</span>':''}
+        </div>`;
+        cells+=`<div class="cal-cell clickable ${isToday?'today':''}" style="border-color:${disc.border};background:${disc.bg}" onclick="calDayDetail('${dateStr}')">
+          <div class="daynum">${day}</div>
+          ${chips}
+          <div class="meta">${d.n} trade${d.n>1?'s':''}</div>
+        </div>`;
+      } else {
+        const klass=d.pnl>0?'win':d.pnl<0?'loss':'';
+        const phases=[...d.phases];
+        const phaseLabel = phases.length>1 ? 'EVAL·FUND' : phases.length===1 ? (phases[0]==='funded'?'FUNDED':'EVAL') : '';
+        const phaseCls = phases.length>1 ? 'mixed' : phases.length===1 ? phases[0] : '';
+        const chips = `<div class="cal-chips">
+          ${phaseLabel?`<span class="cal-chip ${phaseCls}">${phaseLabel}</span>`:''}
+          ${d.dirty?'<span class="cal-chip err">REGLA SALTADA</span>':''}
+          ${unfilledCount?`<span class="cal-chip ne" title="entrada(s) no ejecutada(s)">NO EJEC${unfilledCount>1?' ×'+unfilledCount:''}</span>`:''}
+        </div>`;
+        cells+=`<div class="cal-cell clickable ${klass} ${isToday?'today':''}" onclick="calDayDetail('${dateStr}')">
+          <div class="daynum">${day}</div>
+          ${chips}
+          <div class="pnl ${cls(d.pnl)}">${fmt$(d.pnl)}</div>
+          <div class="meta">${d.n} trade${d.n>1?'s':''} · ${fmtR(d.r)}</div>
+        </div>`;
+      }
+    } else if(noday && CAL_VIEW==='disciplina'){
+      const disc=noTradeDisciplina(noday);
+      cells+=`<div class="cal-cell clickable ${isToday?'today':''}" style="border-color:${disc.border};background:${disc.bg}" onclick="editNoTrade('${noday.id}')" title="${NOTRADE_REASONS[noday.reason]||''}">
+        <div class="daynum">${day}</div>
+        <div class="cal-chips"><span class="cal-chip" style="background:${disc.chipBg};color:${disc.chipFg}">${disc.label}</span><span class="cal-chip rest">SIN OPERAR</span></div>
+        <div class="meta nt-reason">${NOTRADE_REASONS[noday.reason]||''}</div>
+      </div>`;
+    } else if(noday){
+      cells+=`<div class="cal-cell notrade clickable ${isToday?'today':''}" onclick="editNoTrade('${noday.id}')" title="${NOTRADE_REASONS[noday.reason]||''}">
+        <div class="daynum">${day}</div>
+        <div class="cal-chips"><span class="cal-chip rest">SIN OPERAR</span>${unfilledCount?`<span class="cal-chip ne">NO EJEC${unfilledCount>1?' ×'+unfilledCount:''}</span>`:''}</div>
+        <div class="meta nt-reason">${NOTRADE_REASONS[noday.reason]||''}</div>
+      </div>`;
+    } else if(unfilledCount){
+      cells+=`<div class="cal-cell notrade clickable ${isToday?'today':''}" onclick="editNoTrade('${ntList.find(n=>n.type==='unfilled').id}')" title="entrada no ejecutada">
+        <div class="daynum">${day}</div>
+        <div class="cal-chips"><span class="cal-chip ne">NO EJECUTADA${unfilledCount>1?' ×'+unfilledCount:''}</span></div>
+      </div>`;
+    } else {
+      cells+=`<div class="cal-cell ${isToday?'today':''}"><div class="daynum">${day}</div></div>`;
+    }
+  }
+
+  // stats de disciplina del mes
+  const tradeDisc=monthDays.map(d=>dayDisciplina(d.trades)).filter(x=>x.score!=null);
+  // días sin operar del mes (sin trades ese día) que tienen marcado si seguiste el plan
+  const noDayDisc=(DB.noTradeDays||[]).filter(n=>{
+    if((n.type||'noday')!=='noday') return false;
+    const [yy,mm,dd]=n.date.split('-').map(Number);
+    return yy===CAL_YEAR && (mm-1)===CAL_MONTH && !byDay[dd];
+  }).map(noTradeDisciplina);
+  const noDayMarked=noDayDisc.filter(x=>x.score!=null);
+  const noDayUnmarked=noDayDisc.length-noDayMarked.length;
+  const discDays=[...tradeDisc,...noDayMarked];
+  const discAvg=discDays.length?discDays.reduce((s,x)=>s+x.score,0)/discDays.length:null;
+  const discLabel=discAvg==null?'—':discAvg>=3.5?'A+':discAvg>=2.5?'A':discAvg>=1.5?'B':'C';
+
+  v.innerHTML=`
+    <div class="phase-filter" style="margin-bottom:14px">
+      <button class="phase-btn ${CAL_VIEW==='pnl'?'active':''}" onclick="calSetView('pnl')">💶 PnL</button>
+      <button class="phase-btn ${CAL_VIEW==='disciplina'?'active':''}" onclick="calSetView('disciplina')">🎯 Disciplina</button>
+    </div>
+    ${CAL_VIEW==='disciplina'?`<div class="insight" style="margin-bottom:14px">Aquí no importa el dinero, sino si seguiste tu plan. Cada día se colorea por la calidad media de tus trades: <b>A+</b> verde fuerte, <b>A</b> verde, <b>B</b> amarillo, <b>C</b> rojo. Un trade con cualquier flag de error (miedo, FOMO...) cuenta como <b>C</b>. Los días sin operar salen en verde si seguiste tu plan y en rojo si no (gris si no lo has marcado). Lo importante es acumular días verdes de disciplina, pase lo que pase con el PnL.</div>`:''}
+    <div class="cal-head">
+      <button class="btn ghost sm icon" onclick="calShift(-1)">←</button>
+      <div class="month">${monthName}</div>
+      <button class="btn ghost sm icon" onclick="calShift(1)">→</button>
+    </div>
+    <div class="cal-grid">
+      ${dows.map(d=>`<div class="cal-dow">${d}</div>`).join('')}
+      ${cells}
+    </div>
+    <div class="cal-month-stats">
+      ${CAL_VIEW==='disciplina'?`
+      <div class="s"><span class="k">Nota media del mes</span><span class="v ${discLabel==='A+'||discLabel==='A'?'pos':discLabel==='C'?'neg':''}">${discLabel}</span></div>
+      <div class="s"><span class="k">Días A+/A</span><span class="v pos">${discDays.filter(x=>x.score>=2.5).length}</span></div>
+      <div class="s"><span class="k">Días B</span><span class="v" style="color:var(--amber)">${discDays.filter(x=>x.score>=1.5&&x.score<2.5).length}</span></div>
+      <div class="s"><span class="k">Días C</span><span class="v neg">${discDays.filter(x=>x.score<1.5).length}</span></div>
+      <div class="s"><span class="k">Días operados</span><span class="v">${monthDays.length}</span></div>
+      ${noDayDisc.length?`<div class="s"><span class="k">Sin operar con plan ✓</span><span class="v pos">${noDayMarked.filter(x=>x.score>=3.5).length}${noDayUnmarked?` <span style="font-size:11px;color:var(--ink-faint)">(${noDayUnmarked} sin marcar)</span>`:''}</span></div>`:''}
+      `:`
+      <div class="s"><span class="k">P&L del mes</span><span class="v ${cls(monthPnl)}">${fmt$(monthPnl)}</span></div>
+      <div class="s"><span class="k">Días verdes</span><span class="v pos">${greenDays}</span></div>
+      <div class="s"><span class="k">Días rojos</span><span class="v neg">${redDays}</span></div>
+      <div class="s"><span class="k">Días operados</span><span class="v">${monthDays.length}</span></div>
+      `}
+      ${(()=>{
+        const ntMonth=(DB.noTradeDays||[]).filter(n=>{
+          const [yy,mm]=n.date.split('-').map(Number);
+          return yy===CAL_YEAR && (mm-1)===CAL_MONTH;
+        });
+        if(!ntMonth.length) return '';
+        const days=ntMonth.filter(n=>(n.type||'noday')==='noday');
+        const unfilled=ntMonth.filter(n=>n.type==='unfilled');
+        const noSetup=days.filter(n=>n.reason==='no_setup').length;
+        let out='';
+        if(days.length) out+=`<div class="s"><span class="k">Días sin operar</span><span class="v" style="color:var(--ink-dim)">${days.length}${noSetup?` <span style="font-size:11px;color:var(--ink-faint)">(${noSetup} sin setup)</span>`:''}</span></div>`;
+        if(unfilled.length) out+=`<div class="s"><span class="k">Entradas no ejecutadas</span><span class="v" style="color:var(--amber)">${unfilled.length}</span></div>`;
+        return out;
+      })()}
+    </div>
+    <div class="hint" style="margin-top:14px">Toca un día para ver el detalle. 🚫 = día sin trade (toca para editarlo). El punto rojo marca días con algún error de ejecución.</div>
+  `;
+}
+
+function calDayDetail(dateStr){
+  const dayTrades=DB.trades.filter(t=>t.date===dateStr).sort((a,b)=>a.id<b.id?-1:1);
+  const dPnl=totalPnl(dayTrades), dR=totalR(dayTrades);
+  const human=new Date(dateStr).toLocaleDateString('es-ES',{weekday:'long',day:'numeric',month:'long'});
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2 style="text-transform:capitalize">${human} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="grid g-3" style="gap:10px;margin-bottom:16px">
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">P&L</div><div class="big ${cls(dPnl)}">${fmt$(dPnl)}</div></div>
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">R TOTAL</div><div class="big ${cls(dR)}">${fmtR(dR)}</div></div>
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">TRADES</div><div class="big">${dayTrades.length}</div></div>
+    </div>
+    ${(()=>{ const shownG=new Set(); return dayTrades.map(t=>{
+      const errs=(t.flags||[]).filter(f=>f!=='clean');
+      const nCp=copySiblings(t).length;
+      // capturas una sola vez por grupo de copias
+      const showImg=!t.copyGroup||!shownG.has(t.copyGroup); if(t.copyGroup) shownG.add(t.copyGroup);
+      return `<div class="card" style="padding:12px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><b>${t.symbol}</b> <span class="hint">${isMinDay(t)?'📅 Día mínimo · ':''}${t.setup} · ${t.session}${t.account?' · '+t.account:''}${nCp?` · ⧉ copia (${nCp+1} cuentas)`:''}</span></div>
+          <div style="font-family:var(--mono);font-weight:700" class="${cls(t.realizedR)}">${fmtR(t.realizedR)} · ${fmt$(t.pnl)}</div>
+        </div>
+        ${errs.length?`<div style="margin-top:6px">${errs.map(f=>`<span class="tag bad" style="margin:1px">${FLAG_LABELS[f]||f}</span>`).join('')}</div>`:''}
+        ${t.note?`<div class="hint" style="margin-top:6px">${t.note}</div>`:''}
+        ${showImg&&tradeImgs(t).length?`<div class="thumb-row">${tradeImgs(t).map(img=>`<img class="thumb" ${imgAttrs(img)} onclick="lightbox(this.dataset.ref||this.src)">`).join('')}</div>`:''}
+      </div>`;
+    }).join(''); })()||'<p class="hint">Sin trades este día.</p>'}
+    <div class="modal-actions"><button class="btn ghost" onclick="closeModal()">Cerrar</button></div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+}
+
+function lightbox(src){
+  let lb=$('#lightbox');
+  if(!lb){ lb=document.createElement('div'); lb.id='lightbox'; lb.className='lightbox'; lb.onclick=()=>lb.classList.remove('show'); document.body.appendChild(lb); }
+  lb.innerHTML=`<img ${imgAttrs(src)}>`;
+  lb.classList.add('show');
+}
+
+/* ============================================================
+   JOURNAL
+   ============================================================ */
+let JOURNAL_FILTER = 'all';
+function renderJournal(v, T){
+  const filtered = JOURNAL_FILTER==='errors' ? T.filter(t=>(t.flags||[]).some(f=>f!=='clean')) :
+                   JOURNAL_FILTER==='clean' ? T.filter(t=>!(t.flags||[]).some(f=>f!=='clean')) : T;
+  v.innerHTML=`
+    <div class="section-title">Journal</div>
+    <div class="pill-row">
+      <button class="chip ${JOURNAL_FILTER==='all'?'on good':''}" onclick="setJournalFilter('all')">Todos (${T.length})</button>
+      <button class="chip ${JOURNAL_FILTER==='clean'?'on good':''}" onclick="setJournalFilter('clean')">Limpios</button>
+      <button class="chip ${JOURNAL_FILTER==='errors'?'on':''}" onclick="setJournalFilter('errors')">Con error</button>
+    </div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Fecha</th><th>Símbolo</th><th>Setup</th><th>Sesión</th><th>Plan R</th><th>Real R</th><th>P&L</th><th>Estado</th><th>Flags</th><th></th></tr></thead>
+      <tbody>${filtered.map(t=>{
+        const errs=(t.flags||[]).filter(f=>f!=='clean');
+        return `<tr>
+          <td>${t.date}</td>
+          <td>${t.symbol||'—'}${tradeImgs(t).length?` <span title="${tradeImgs(t).length} imagen(es)" style="opacity:.6">📎</span>`:''}${copySiblings(t).length?` <span class="hint" title="Mismo trade copiado en: ${copySiblings(t).map(x=>(x.account||'sin cuenta').replace(/"/g,'&quot;')).join(', ')}">⧉${copySiblings(t).length+1}</span>`:''}</td>
+          <td style="font-family:var(--sans)">${t.setup||'—'}${isMinDay(t)?' <span class="tag neutral" title="Día mínimo: va aparte de las estadísticas">📅 día mín.</span>':''}</td>
+          <td>${t.session||'—'}</td>
+          <td>${fmt(t.plannedR,1)}</td>
+          <td class="${cls(t.realizedR)}">${fmtR(t.realizedR)}</td>
+          <td class="${cls(t.pnl)}">${fmt$(t.pnl)}</td>
+          <td><span class="tag ${t.result==='win'?'ok':t.result==='loss'?'bad':'neutral'}">${t.result==='win'?'Gan':t.result==='loss'?'Perd':'BE'}</span>${t.exitType==='manual'?' <span class="tag warn" title="cierre manual">✋</span>':''}</td>
+          <td>${errs.length?errs.map(f=>`<span class="tag bad" style="margin:1px">${FLAG_LABELS[f]||f}</span>`).join(''):'<span class="tag ok">limpio</span>'}</td>
+          <td><button class="btn ghost sm icon" onclick="editTrade('${t.id}')">✎</button></td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div>
+  `;
+}
+function setJournalFilter(f){ JOURNAL_FILTER=f; render(); }
+
+/* ============================================================
+   CHARTS
+   ============================================================ */
+function chartBase(){
+  return {responsive:true,maintainAspectRatio:false,
+    plugins:{legend:{display:false},tooltip:{backgroundColor:'#161c27',borderColor:'#1f2733',borderWidth:1,titleColor:'#e8edf4',bodyColor:'#8a97a8',padding:10}},
+    scales:{x:{grid:{color:'#1f2733'},ticks:{color:'#5a6573',font:{size:10}}},y:{grid:{color:'#1f2733'},ticks:{color:'#5a6573',font:{size:10}}}}};
+}
+function drawEquity(id, T){
+  const el=$('#'+id); if(!el) return;
+  const curve=equityCurve(T);
+  const final=curve.length?curve[curve.length-1].cum:0;
+  const color=final>=0?'#3ddc84':'#ff5d5d';
+  const grad=el.getContext('2d').createLinearGradient(0,0,0,200);
+  grad.addColorStop(0, final>=0?'rgba(61,220,132,.25)':'rgba(255,93,93,.25)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
+  charts.eq=new Chart(el,{type:'line',data:{labels:curve.map((p,i)=>i+1),
+    datasets:[{data:curve.map(p=>p.cum),borderColor:color,backgroundColor:grad,fill:true,tension:.25,pointRadius:0,borderWidth:2}]},
+    options:chartBase()});
+}
+function drawCumulative(id, T){
+  const el=$('#'+id); if(!el) return;
+  const ch=[...T].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  let cumR=0, wins=0, counted=0;
+  const wrPts=[], expPts=[];
+  ch.forEach((t,i)=>{
+    cumR+=(t.realizedR||0);
+    if(t.result!=='be'){ counted++; if(t.result==='win')wins++; }
+    wrPts.push(counted? wins/counted*100 : 0);
+    expPts.push(cumR/(i+1));
+  });
+  charts.cum=new Chart(el,{type:'line',
+    data:{labels:ch.map((p,i)=>i+1),datasets:[
+      {label:'Winrate %',data:wrPts,borderColor:'#4d9fff',backgroundColor:'transparent',tension:.25,pointRadius:0,borderWidth:2,yAxisID:'y'},
+      {label:'Expectancy R',data:expPts,borderColor:'#3ddc84',backgroundColor:'transparent',tension:.25,pointRadius:0,borderWidth:2,yAxisID:'y1'}
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,
+      plugins:{legend:{display:false},tooltip:{backgroundColor:'#161c27',borderColor:'#1f2733',borderWidth:1,titleColor:'#e8edf4',bodyColor:'#8a97a8',padding:10}},
+      scales:{
+        x:{grid:{color:'#1f2733'},ticks:{color:'#5a6573',font:{size:10}}},
+        y:{position:'left',grid:{color:'#1f2733'},ticks:{color:'#4d9fff',font:{size:10},stepSize:20,callback:v=>Math.round(v)+'%'},min:0,max:100},
+        y1:{position:'right',grid:{drawOnChartArea:false},ticks:{color:'#3ddc84',font:{size:10},maxTicksLimit:6,callback:v=>Number(v).toFixed(2)+'R'}}
+      }}});
+}
+function drawRRCurve(id, T){
+  const el=$('#'+id); if(!el) return;
+  const o=optimalRR(T);
+  if(!o.enough) return;
+  const labels=o.curve.map(c=>'1:'+String(c.tp).replace('.0',''));
+  const data=o.curve.map(c=>c.exp);
+  const colors=o.curve.map(c=> c.tp===o.best.tp ? '#3ddc84' : 'rgba(61,220,132,.35)');
+  const levels=o.curve.map(c=>c.tp);
+
+  // Plugin que dibuja la línea del objetivo final medio en cada render (robusto, no se borra)
+  const dolLinePlugin={
+    id:'dolLine',
+    afterDraw(chart){
+      if(o.avgDol==null) return;
+      const xScale=chart.scales.x, yScale=chart.scales.y;
+      // interpolar la posición X del objetivo final entre los niveles del eje
+      let xPos=null;
+      for(let i=0;i<levels.length-1;i++){
+        if(o.avgDol>=levels[i] && o.avgDol<=levels[i+1]){
+          const frac=(o.avgDol-levels[i])/(levels[i+1]-levels[i]);
+          const x0=xScale.getPixelForValue(i), x1=xScale.getPixelForValue(i+1);
+          xPos=x0+(x1-x0)*frac;
+          break;
+        }
+      }
+      // si el objetivo final cae más allá del último nivel, lo clavamos al borde derecho
+      if(xPos==null && o.avgDol>levels[levels.length-1]) xPos=xScale.getPixelForValue(levels.length-1);
+      if(xPos==null) return;
+      const ctx=chart.ctx;
+      ctx.save();
+      ctx.strokeStyle='#4d9fff'; ctx.lineWidth=2; ctx.setLineDash([5,4]);
+      ctx.beginPath(); ctx.moveTo(xPos,yScale.top); ctx.lineTo(xPos,yScale.bottom); ctx.stroke();
+      // etiqueta "objetivo final"
+      ctx.setLineDash([]);
+      ctx.fillStyle='#4d9fff';
+      ctx.font='700 10px Inter, sans-serif';
+      ctx.textAlign='center';
+      const label='Objetivo '+fmt(o.avgDol,1).replace('.0','')+'R';
+      const tw=ctx.measureText(label).width;
+      let lx=xPos; if(lx+tw/2>chart.width-4) lx=chart.width-tw/2-4; if(lx-tw/2<4) lx=tw/2+4;
+      ctx.fillRect(lx-tw/2-4,yScale.top-16,tw+8,14);
+      ctx.fillStyle='#0b0e14';
+      ctx.fillText(label,lx,yScale.top-5);
+      ctx.restore();
+    }
+  };
+
+  charts.rr=new Chart(el,{type:'bar',
+    data:{labels,datasets:[{data,backgroundColor:colors,borderRadius:5}]},
+    options:{responsive:true,maintainAspectRatio:false,
+      layout:{padding:{top:18}},
+      plugins:{legend:{display:false},tooltip:{backgroundColor:'#161c27',borderColor:'#1f2733',borderWidth:1,titleColor:'#e8edf4',bodyColor:'#8a97a8',padding:10,
+        callbacks:{label:ctx=>`Exp: ${ctx.parsed.y>=0?'+':''}${ctx.parsed.y.toFixed(2)}R`}}},
+      scales:{
+        x:{grid:{color:'#1f2733'},ticks:{color:'#5a6573',font:{size:10}}},
+        y:{grid:{color:'#1f2733'},ticks:{color:'#5a6573',font:{size:10},callback:v=>Number(v).toFixed(1)+'R'}}
+      }},
+    plugins:[dolLinePlugin]});
+}
+function drawDistribution(id, T){
+  const el=$('#'+id); if(!el) return;
+  // buckets internos + etiquetas legibles
+  const defs=[
+    {key:'peor', label:'Peor de -2R', test:r=>r<-2, color:'#ff5d5d'},
+    {key:'m2m1', label:'-2R a -1R', test:r=>r>=-2&&r<-1, color:'#ff5d5d'},
+    {key:'m1a0', label:'-1R a 0', test:r=>r>=-1&&r<0, color:'#ff5d5d'},
+    {key:'0a1',  label:'0 a 1R', test:r=>r>=0&&r<1, color:'#3ddc84'},
+    {key:'1a2',  label:'1R a 2R', test:r=>r>=1&&r<2, color:'#3ddc84'},
+    {key:'mas2', label:'Más de 2R', test:r=>r>=2, color:'#3ddc84'}
+  ];
+  const counts=defs.map(d=>0);
+  T.forEach(t=>{
+    const r=t.realizedR||0;
+    const i=defs.findIndex(d=>d.test(r));
+    if(i>=0) counts[i]++;
+  });
+  const base=chartBase();
+  base.scales.y.title={display:true,text:'Nº de trades',color:'#8a97a8',font:{size:11,weight:'600'}};
+  base.scales.y.ticks.precision=0;
+  base.scales.y.ticks.stepSize=1;
+  base.plugins.tooltip.callbacks={label:ctx=>`${ctx.parsed.y} trade${ctx.parsed.y===1?'':'s'}`};
+  charts.dist=new Chart(el,{type:'bar',data:{labels:defs.map(d=>d.label),
+    datasets:[{data:counts,backgroundColor:defs.map(d=>d.color),borderRadius:5}]},
+    options:base});
+}
+
+/* ============================================================
+   MODAL — TRADE
+   ============================================================ */
+const FLAG_LABELS={
+  clean:'Limpio',
+  no_zone:'Entré sin llegar a la zona',
+  no_confirm:'Sin confirmación 5m/1m',
+  sl_over:'SL de más de 200 pips',
+  rr_low:'R:B menor de 1:2',
+  doubt:'Entré con dudas',
+  fomo:'Entrada FOMO',
+  revenge:'Revenge trade',
+  early_close:'Cerré antes por miedo',
+  no_secure:'No aseguré el 1:2 y revirtió',
+  moved_stop:'Moví el stop',
+  oversized:'Sobre-dimensioné'
+};
+// Plan de trading — checklist que aparece al registrar.
+// Mecanismo de Retroceso e Impulso. Las 3 primeras reglas de cada tipo son innegociables (gestión de riesgo):
+// si falla cualquiera, el setup pasa a C y se marca el error correspondiente al guardar.
+const PLAN_INNEGOCIABLES=[
+  'Stop loss de 200 pips o menos (innegociable)',
+  'Riesgo/beneficio mínimo de 1:2 (innegociable)',
+  'Sin dudas: lo veo claro. Si hay duda, no se ejecuta (innegociable)'
+];
+const PLAN_IMPULSO=[...PLAN_INNEGOCIABLES,
+  'El precio ya está dentro de la zona extrema o decisional del macro (Diario, 4H o 1H)',
+  'Rompimiento dentro de la zona en 15m (si hubo rompimiento previo en 1H o 15m)',
+  'Zona decisional y extrema marcadas en 15m',
+  'Quiebre confirmado en 5m',
+  'La misma acción de quiebre en 1m',
+  'Objetivo decidido antes de entrar: 1:2 o alto/bajo anterior del macro'
+];
+const PLAN_RETROCESO=[...PLAN_INNEGOCIABLES,
+  'Retroceso confirmado: el precio rompió el bajo/alto anterior del fractal (Diario, 4H o 1H)',
+  'Rompimiento a favor verificado en 15m (más fiable si también en 1H)',
+  'Zona extrema y zona decisional marcadas en el fractal que rompió',
+  'El precio llegó a la zona en la siguiente sesión',
+  'Quiebre confirmado en 5m',
+  'La misma acción de quiebre en 1m',
+  'Salida en la siguiente zona decisional/extrema o en 1:2, lo que llegue antes'
+];
+// Día mínimo (fondeadas): trade para cumplir los días mínimos de la prop (riesgo alto, objetivo pequeño).
+// NO es trading normal: va APARTE de las estadísticas de rendimiento y disciplina, pero el dinero sí cuenta
+// (balance de la cuenta, ROI y P&L del calendario).
+const PLAN_DIA_MINIMO=[
+  'Stop loss de 200 pips o menos',
+  'El precio está dentro de una zona extrema o decisional (15m o más)',
+  'Quiebre confirmado en 5m'
+];
+const ENTRY_TYPE_LABELS={impulso:'Impulso',retroceso:'Retroceso',dia_minimo:'Día mínimo (fondeada)',
+  // tipos antiguos (solo por si se importa un journal viejo)
+  manipulacion:'Manipulación (antiguo)',manipulacion_ltf:'Manipulación LTF (antiguo)',continuacion:'Continuación (antiguo)'};
+const isMinDay=t=>!!t&&t.entryType==='dia_minimo';
+// Posiciones de las reglas innegociables en cada checklist y el error que se marca si fallan
+const INNEG_INDEX={impulso:[0,1,2],retroceso:[0,1,2]};
+const INNEG_FLAGS=['sl_over','rr_low','doubt'];
+function innegFailed(type, checked){ return (INNEG_INDEX[type]||[]).filter(i=>!(checked||[]).includes(i)); }
+// Reglas que se añaden SOLO en trades de cuentas fondeadas (al final, para no mover las demás). Ahora ninguna.
+const PLAN_FUNDED_EXTRA=[];
+// Devuelve la checklist del tipo de entrada (por defecto Impulso).
+function planChecklist(entryType, phase, session){
+  if(entryType==='dia_minimo') return PLAN_DIA_MINIMO;   // tiene sus propias reglas
+  const base = entryType==='retroceso' ? PLAN_RETROCESO : PLAN_IMPULSO;
+  return (phase==='funded' && PLAN_FUNDED_EXTRA.length) ? [...base, ...PLAN_FUNDED_EXTRA] : base;
+}
+// Fase del trade que se está editando en el formulario (manual o deducida de la cuenta)
+// Fase del último trade guardado (para proponerla por defecto en uno nuevo)
+function lastTradePhase(){
+  const t=[...(DB.trades||[])].sort((a,b)=>a.date<b.date?1:a.date>b.date?-1:0)[0];
+  return t?(tradePhase(t)||'eval'):'eval';
+}
+function modalPhase(){
+  const v=$('#f_phase')?.value;
+  if(v) return v;
+  const acc=DB.accounts.find(a=>a.name===$('#f_account')?.value);
+  return acc ? (acc.phase==='Funded'?'funded':'eval') : '';
+}
+/* ---------- COPIAS: un mismo trade en varias cuentas ----------
+   Cada copia es un trade propio en DB.trades (cuenta como un trade más en todas las estadísticas),
+   con su cuenta, fase, riesgo y P&L. Comparten copyGroup y se sincronizan al editar. */
+function accPhaseOf(name){ const a=DB.accounts.find(x=>x.name===name); return a?(a.phase==='Funded'?'funded':'eval'):''; }
+function copySiblings(t){ return (t&&t.copyGroup)?(DB.trades||[]).filter(x=>x.copyGroup===t.copyGroup&&x.id!==t.id):[]; }
+// Las capturas se guardan una sola vez por grupo (no se duplican en el almacenamiento)
+function tradeImgs(t){
+  if(t&&t.images&&t.images.length) return t.images;
+  const h=copySiblings(t).find(x=>x.images&&x.images.length);
+  return h?h.images:[];
+}
+// Copias marcadas en el formulario: [{acc, risk, pnl}]
+function modalCopies(){
+  const prim=$('#f_account')?.value||'';
+  return $$('#f_copies .copy-row').filter(r=>{
+    const c=r.querySelector('.copy-chk'); return c&&c.checked;
+  }).map(r=>{
+    const acc=DB.accounts.find(a=>a.id===r.dataset.accid);
+    const risk=parseFloat(r.querySelector('.copy-risk')?.value);
+    const pnl=parseFloat(r.querySelector('.copy-pnl')?.value);
+    return {acc, risk:isNaN(risk)?0:risk, pnl};
+  }).filter(c=>c.acc && c.acc.name!==prim);
+}
+// Fase con la que se pinta la checklist: si alguna cuenta del grupo es fondeada,
+// aparece también la regla de fondeadas (solo cuenta para esas cuentas).
+function checklistPhase(){
+  const p=modalPhase();
+  if(TRADE_MODE==='sim'||p==='funded') return p;
+  const sibs=($('#modalBg')?._copySibIds||[]).map(id=>DB.trades.find(x=>x.id===id)).filter(Boolean);
+  const anyFunded=sibs.some(s=>tradePhase(s)==='funded')||modalCopies().some(c=>c.acc.phase==='Funded');
+  return anyFunded?'funded':p;
+}
+function onCopyToggle(){
+  const prim=$('#f_account')?.value||'';
+  $$('#f_copies .copy-row').forEach(r=>{
+    const acc=DB.accounts.find(a=>a.id===r.dataset.accid);
+    const isPrim=acc&&acc.name===prim;
+    r.style.display=isPrim?'none':'';
+    const c=r.querySelector('.copy-chk');
+    if(isPrim&&c) c.checked=false;
+    const f=r.querySelector('.copy-fields');
+    if(f) f.style.display=(c&&c.checked)?'':'none';
+  });
+  rebuildChecklist();
+}
+// Calcula el setup automático según fallos: 0=A+, 1=A, 2=B, 3+=C
+function autoSetup(checkedCount, total){
+  const fails = total - checkedCount;
+  if(fails<=0) return 'A+';
+  if(fails===1) return 'A';
+  if(fails===2) return 'B';
+  return 'C';
+}
+// Setup automático teniendo en cuenta las innegociables: si falla alguna → C
+function autoSetupFor(entryType, checked, total){
+  if(innegFailed(entryType, checked).length) return 'C';
+  return autoSetup((checked||[]).length, total);
+}
+// ¿El trade cumplió TODO su plan? Se mide contra la checklist que había CUANDO se registró,
+// no contra la actual (si no, añadir reglas nuevas "estropearía" los trades antiguos).
+//  · Trades nuevos guardan planTotal (nº de reglas en ese momento).
+//  · Trades con tipo de entrada pero sin planTotal → su setup guardado (A+ = todas cumplidas).
+//  · Trades muy antiguos (checklist original de 8 reglas) → 8 o más marcadas.
+function planComplete(t){
+  const n=(t.planChecked||[]).length;
+  if(t.planTotal) return n>=t.planTotal;
+  if(t.entryType) return t.setup==='Setup A+';
+  return n>=8;
+}
+// Compat: PLAN_CHECKLIST apunta a manipulación (para código antiguo)
+const PLAN_CHECKLIST=PLAN_IMPULSO;
+const SETUPS=['Setup A+','Setup A','Setup B','Setup C'];
+const SYMBOLS=['XAUUSD','MGC','GC','Otro'];   // XAUUSD = oro en CFD · MGC/GC = futuros de oro
+const SESSIONS=['Asia (0-9h)','Londres (9-14:30h)','Nueva York (14:30-22h)','Fuera de sesión'];   // hora de Madrid
+// Fractal de referencia (el que rompió o donde está la zona). Se guarda en el campo moveType.
+const MOVE_TYPES={
+  d1:'Diario',
+  h4:'4H',
+  h1:'1H'
+};
+const ZONE_TYPES={extrema:'Zona extrema',decisional:'Zona decisional'};
+const DIRECTIONS={long:'Largo (compra)',short:'Corto (venta)'};
+const TARGET_TYPES={rr2:'Asegurar 1:2',zona:'Siguiente zona / alto-bajo del macro'};
+// Desgloses de la estrategia (tarjeta de Rendimiento)
+function labeledBreakdown(T,fn){ return breakdown(T.map(t=>({...t,_k:fn(t)})),'_k').filter(r=>r.key!=='—'); }
+function strategyBreakdowns(T){
+  const blocks=[
+    ['Tipo de entrada',t=>ENTRY_TYPE_LABELS[t.entryType]||null],
+    ['Fractal de referencia',t=>MOVE_TYPES[t.moveType]||null],
+    ['Zona de entrada',t=>ZONE_TYPES[t.zone]||null],
+    ['Dirección',t=>DIRECTIONS[t.direction]||null],
+    ['Objetivo elegido',t=>TARGET_TYPES[t.targetType]||null]
+  ];
+  const html=blocks.map(([title,fn])=>{
+    const rows=labeledBreakdown(T,fn);
+    return rows.length?`<div style="margin-bottom:14px"><div class="hint" style="font-weight:600;margin-bottom:4px">${title}</div>${breakdownTable(rows)}</div>`:'';
+  }).join('');
+  const re=T.filter(t=>t.entryType==='retroceso'), im=T.filter(t=>t.entryType==='impulso');
+  let verdict;
+  if(re.length>=10 && im.length>=10){
+    const better=expectancy(im)>=expectancy(re);
+    verdict=`<div class="insight ${better?'':'warn'}">Impulso ${fmtR(expectancy(im))} por trade (${im.length}) frente a Retroceso ${fmtR(expectancy(re))} (${re.length}). ${better?'Los datos confirman tu plan: el impulso rinde más. Sé muy selectivo con los retrocesos o llévalos a simulado.':'De momento los retrocesos no rinden peor que los impulsos, aunque tu plan diga evitarlos. Sigue registrando antes de cambiar nada.'}</div>`;
+  } else verdict=`<div class="insight">Cuando tengas 10 o más trades de Impulso y 10 de Retroceso te digo si los retrocesos te compensan (llevas ${im.length} y ${re.length}).</div>`;
+  return (html||'<p class="hint">Rellena tipo de entrada, fractal, zona, dirección y objetivo en tus trades para ver aquí qué parte de tu mecanismo funciona mejor.</p>')+verdict;
+}
+
+
+// Modo del formulario de trade: 'real' (DB.trades) o 'sim' (DB.paperTrades, trades simulados no operados)
+let TRADE_MODE='real';
+function openTradeModal(){ TRADE_MODE='real'; tradeModal(); }
+function openSimModal(){ TRADE_MODE='sim'; tradeModal(); }
+function editSim(id){ TRADE_MODE='sim'; tradeModal((DB.paperTrades||[]).find(t=>t.id===id)); }
+
+/* ---------- Dia sense trade ---------- */
+function openNoTradeModal(existing){
+  const e=existing||{};
+  const type=e.type||'noday';
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${existing?'Editar registro':'Sin trade'} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="field"><label>Tipo de registro</label>
+      <select id="nt_type" onchange="ntTypeChange()">
+        <option value="noday" ${type==='noday'?'selected':''}>Día sin operar (no entré en todo el día)</option>
+        <option value="unfilled" ${type==='unfilled'?'selected':''}>Entrada no ejecutada (limit no filleada, cancelada...)</option>
+      </select>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Fecha</label><input type="date" id="nt_date" value="${e.date||todayISO()}"></div>
+      <div class="field" id="nt_reasonWrap"><label>Motivo</label>
+        <select id="nt_reason">
+          ${Object.entries(NOTRADE_REASONS).map(([k,l])=>`<option value="${k}" ${e.reason===k?'selected':''}>${l}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+    <div class="field" id="nt_planWrap"><label>¿Has seguido tu plan? <span class="hint">cuenta para el calendario de disciplina</span></label>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <label class="plan-item" style="flex:1;min-width:150px;margin:0;border:1px solid var(--line);border-radius:9px;padding:9px 11px;align-items:center"><input type="radio" name="nt_plan" value="yes" ${e.planFollowed==='yes'?'checked':''}><span>✅ He seguido mi plan</span></label>
+        <label class="plan-item" style="flex:1;min-width:150px;margin:0;border:1px solid var(--line);border-radius:9px;padding:9px 11px;align-items:center"><input type="radio" name="nt_plan" value="no" ${e.planFollowed==='no'?'checked':''}><span>❌ No he seguido mi plan</span></label>
+      </div>
+    </div>
+    <div class="field"><label id="nt_noteLabel">¿Por qué no entré? <span class="hint">explícalo bien, es tan valioso como un trade</span></label>
+      <textarea id="nt_note" rows="4" placeholder="Qué viste en el gráfico, qué faltaba para tu setup, por qué decidiste esperar...">${e.note||''}</textarea>
+    </div>
+    <div class="field"><label>Capturas (gráfico, contexto...)</label>
+      <div class="img-drop" id="nt_imgdrop" onclick="document.getElementById('nt_imgInput').click()">📎 Toca para adjuntar imágenes (se comprimen solas)</div>
+      <input type="file" id="nt_imgInput" accept="image/*" multiple style="display:none" onchange="handleNoTradeImages(event)">
+      <div class="thumb-row" id="nt_thumbs"></div>
+    </div>
+    <div class="insight" id="nt_insight" style="margin-top:4px"></div>
+    <div class="modal-actions">
+      ${existing?`<button class="btn danger" onclick="deleteNoTrade('${existing.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveNoTrade('${existing?existing.id:''}')">Guardar</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+  $('#modalBg')._ntImages=[...(e.images||[])];
+  renderNoTradeThumbs();
+  ntTypeChange();
+}
+// Adapta el modal según el tipo (día sin operar vs entrada no ejecutada)
+function ntTypeChange(){
+  const type=$('#nt_type')?.value||'noday';
+  const reasonWrap=$('#nt_reasonWrap');
+  const noteLabel=$('#nt_noteLabel');
+  const insight=$('#nt_insight');
+  const note=$('#nt_note');
+  const planWrap=$('#nt_planWrap');
+  if(planWrap) planWrap.style.display = type==='unfilled' ? 'none' : '';
+  if(type==='unfilled'){
+    if(reasonWrap) reasonWrap.style.display='none';   // sin motivos predefinidos, lo explica en la nota
+    if(noteLabel) noteLabel.innerHTML=`¿Qué pasó con la entrada? <span class="hint">explica cómo la gestionaste</span>`;
+    if(note && !note.value) note.placeholder='Ej: sell limit no filleada por 1 punto, el precio fue a TP sin mí. Buena lectura, límite demasiado ajustado.';
+    if(insight) insight.innerHTML='Esto NO cuenta en tu winrate ni expectancy (no hubo operación real). Se registra solo para que veas cómo gestionas estas situaciones con el tiempo.';
+  } else {
+    if(reasonWrap) reasonWrap.style.display='';
+    if(noteLabel) noteLabel.innerHTML=`¿Por qué no entré? <span class="hint">explícalo bien, es tan valioso como un trade</span>`;
+    if(note && !note.value) note.placeholder='Qué viste en el gráfico, qué faltaba para tu setup, por qué decidiste esperar...';
+    if(insight) insight.innerHTML='Registrar los días que no operas también es disciplina. Si el motivo es "no había setup", es paciencia bien hecha.';
+  }
+}
+async function handleNoTradeImages(ev){
+  const files=[...ev.target.files];
+  for(const f of files){
+    if(!f.type.startsWith('image/')) continue;
+    const compressed=await compressImage(f);
+    $('#modalBg')._ntImages.push(compressed);
+  }
+  renderNoTradeThumbs();
+  ev.target.value='';
+}
+function renderNoTradeThumbs(){
+  const imgs=$('#modalBg')._ntImages||[];
+  const c=$('#nt_thumbs');
+  if(!c) return;
+  c.innerHTML=imgs.map((src,i)=>`<div style="position:relative">
+    <img class="thumb" ${imgAttrs(src)}>
+    <button onclick="removeNoTradeImage(${i})" style="position:absolute;top:-6px;right:-6px;background:var(--red);color:#fff;border:none;border-radius:50%;width:20px;height:20px;font-size:12px;cursor:pointer;line-height:1">×</button>
+  </div>`).join('');
+  $$('#nt_thumbs .thumb').forEach((el,i)=>{ el.onclick=()=>lightbox(imgs[i]); });
+}
+function removeNoTradeImage(i){
+  $('#modalBg')._ntImages.splice(i,1);
+  renderNoTradeThumbs();
+}
+function saveNoTrade(id){
+  const date=$('#nt_date').value;
+  if(!date){ toast('Pon una fecha'); return; }
+  const type=$('#nt_type').value;
+  // Solo un "día sin operar" por fecha. Las entradas no ejecutadas pueden repetirse.
+  if(type==='noday'){
+    const dup=(DB.noTradeDays||[]).find(d=>d.date===date && (d.type||'noday')==='noday' && d.id!==id);
+    if(dup){ toast('Ya tienes un día sin operar para esta fecha'); return; }
+  }
+  const planSel=document.querySelector('input[name="nt_plan"]:checked');
+  const nt={ id:id||uid(), date, type, reason:type==='noday'?$('#nt_reason').value:'',
+    planFollowed: type==='noday' ? (planSel?planSel.value:'') : '',
+    note:$('#nt_note').value.trim(), images:[...($('#modalBg')._ntImages||[])] };
+  DB.noTradeDays=DB.noTradeDays||[];
+  if(id){ const i=DB.noTradeDays.findIndex(d=>d.id===id); DB.noTradeDays[i]=nt; }
+  else DB.noTradeDays.push(nt);
+  try{ save(); }
+  catch(err){ toast('⚠ Almacenamiento lleno. Quita alguna imagen.'); if(!id) DB.noTradeDays.pop(); return; }
+  closeModal(); render();
+  if(id){ toast('Actualizado'); }
+  else if(type==='unfilled'){ toast('Entrada no ejecutada registrada'); }
+  else { showMantra(processMantra(null)); }
+}
+function deleteNoTrade(id){
+  if(!confirm('¿Eliminar este registro?'))return;
+  DB.noTradeDays=(DB.noTradeDays||[]).filter(d=>d.id!==id);
+  save(); closeModal(); render(); toast('Eliminado');
+}
+function editNoTrade(id){
+  const nt=(DB.noTradeDays||[]).find(d=>d.id===id);
+  if(nt) openNoTradeModal(nt);
+}
+function editTrade(id){ TRADE_MODE='real'; tradeModal(DB.trades.find(t=>t.id===id)); }
+
+function tradeModal(t){
+  const e=t||{};
+  const flags=e.flags||['clean'];
+  const SIM=TRADE_MODE==='sim';
+  const sibs=SIM?[]:copySiblings(e);
+  // Si alguna copia es fondeada y esta no, recupera la regla extra de fondeadas de esa copia
+  let planChecked=[...(e.planChecked||[])];
+  if(sibs.length && tradePhase(e)!=='funded'){
+    const baseLen=planChecklist(e.entryType||'impulso','eval').length;
+    const fs=sibs.find(x=>tradePhase(x)==='funded');
+    if(fs) (fs.planChecked||[]).forEach(i=>{ if(i>=baseLen && !planChecked.includes(i)) planChecked.push(i); });
+  }
+  const defSession=e.session||'';
+  const sibNames=sibs.map(x=>x.account);
+  const copyAccts=SIM?[]:DB.accounts.filter(a=>a.status!=='perdida' && !sibNames.includes(a.name));
+  const defRisk=e.riskUSD??200;
+  const copyHTML=true?'':`<div class="field" id="f_copyWrap"><label>${sibs.length?'Copias de este trade':'¿Lo tomaste también en otras cuentas?'} <span class="hint">cada cuenta cuenta como un trade</span></label>
+      ${sibs.length?`<div class="hint" style="margin-bottom:8px">⧉ Este trade también está en: ${sibs.map(x=>`<a href="#" onclick="event.preventDefault();editTrade('${x.id}')"><b>${x.account||'sin cuenta'}</b></a> (riesgo ${fmt$(x.riskUSD||0)}, P&L ${fmt$(x.pnl||0)})`).join(' · ')}.<br>Al guardar, los cambios se copian a todas (menos cuenta, fase, riesgo y P&L, que son de cada una). Para cambiar el riesgo o P&L de otra cuenta, ábrela desde el enlace.</div>`:''}
+      ${copyAccts.length?`<div id="f_copies" style="display:flex;flex-direction:column;gap:6px">${copyAccts.map(a=>`<div class="copy-row" data-accid="${a.id}" style="${a.name===e.account?'display:none':''}">
+        <label style="display:flex;align-items:center;gap:8px;font-weight:500;text-transform:none;letter-spacing:0;cursor:pointer"><input type="checkbox" class="copy-chk" onchange="onCopyToggle()" style="width:auto"> ${sibs.length?'Añadir a ':''}${a.name} <span class="hint">${a.phase==='Funded'?'(fondeada)':'(eval)'}</span></label>
+        <div class="copy-fields field-row" style="display:none;margin:6px 0 4px 26px">
+          <div class="field" style="margin:0"><label>Riesgo ($)</label><input type="number" class="copy-risk" value="${defRisk}"></div>
+          <div class="field" style="margin:0"><label>P&L ($) <span class="hint">vacío = auto</span></label><input type="number" class="copy-pnl" placeholder="auto"></div>
+        </div>
+      </div>`).join('')}</div>`:`<div class="hint">No hay más cuentas activas${sibs.length?' para añadir':''}.</div>`}
+    </div>`;
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${SIM?(t?'Editar trade simulado':'Nuevo trade simulado'):(t?'Editar trade':'Nuevo trade')} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    ${SIM?`<div class="insight warn" style="margin-bottom:14px">🧪 <b>Trade simulado</b>: el setup que habrías tomado pero no operaste. Apunta el resultado que habría tenido siguiendo tu plan. No cuenta en tus estadísticas reales, cuentas ni calendario.</div>`:''}
+    <div class="field"><label>Tipo de entrada</label>
+      <select id="f_entryType" onchange="rebuildChecklist()">
+        <option value="impulso" ${(e.entryType||'impulso')==='impulso'?'selected':''}>Impulso (precio ya en zona del macro)</option>
+        <option value="retroceso" ${e.entryType==='retroceso'?'selected':''}>Retroceso</option>
+        ${e.entryType&&ENTRY_TYPE_LABELS[e.entryType]&&!['impulso','retroceso','dia_minimo'].includes(e.entryType)?`<option value="${e.entryType}" selected>${ENTRY_TYPE_LABELS[e.entryType]}</option>`:''}
+        ${SIM?'':`<option value="dia_minimo" ${e.entryType==='dia_minimo'?'selected':''}>Día mínimo (fondeada)</option>`}
+      </select>
+      <div class="hint" id="f_entryHint" style="margin-top:6px;display:none"></div>
+    </div>
+    <div class="plan-box">
+      <div class="plan-title">📋 Plan de trading — checklist antes de entrar</div>
+      <div id="f_plan"></div>
+      <div class="plan-count" id="f_planCount"></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Fecha</label><input type="date" id="f_date" value="${e.date||todayISO()}"></div>
+      <div class="field"><label>Símbolo</label><select id="f_symbol">${SYMBOLS.map(s=>`<option ${(e.symbol||'MNQ')===s?'selected':''}>${s}</option>`).join('')}</select></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Setup <span class="hint" id="f_setupAuto"></span></label><select id="f_setup">${SETUPS.map(s=>`<option ${e.setup===s?'selected':''}>${s}</option>`).join('')}</select></div>
+      <div class="field"><label>Sesión</label><select id="f_session" onchange="rebuildChecklist()">${SESSIONS.map(s=>`<option ${defSession===s?'selected':''}>${s}</option>`).join('')}</select></div>
+    </div>
+    <div class="field"><label>Fractal de referencia <span class="hint">el que rompió o donde está la zona del macro</span></label>
+      <select id="f_moveType" onchange="toggleMoveOther()">
+        <option value="" ${!e.moveType?'selected':''}>— no registrado —</option>
+        ${Object.entries(MOVE_TYPES).map(([k,l])=>`<option value="${k}" ${e.moveType===k?'selected':''}>${l}</option>`).join('')}
+      </select>
+      <input type="text" id="f_moveOther" placeholder="Especifica..." value="${e.moveOther||''}" style="margin-top:8px;display:none">
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Dirección</label><select id="f_direction"><option value="">—</option>${Object.entries(DIRECTIONS).map(([k,l])=>`<option value="${k}" ${e.direction===k?'selected':''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Zona de entrada</label><select id="f_zone"><option value="">—</option>${Object.entries(ZONE_TYPES).map(([k,l])=>`<option value="${k}" ${e.zone===k?'selected':''}>${l}</option>`).join('')}</select></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Objetivo elegido</label><select id="f_targetType"><option value="">—</option>${Object.entries(TARGET_TYPES).map(([k,l])=>`<option value="${k}" ${e.targetType===k?'selected':''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Stop (pips) <span class="hint">máximo 200</span></label><input type="number" id="f_stopPips" step="1" min="0" value="${e.stopPips??''}" oninput="checkHardRules()" placeholder="ej. 150"></div>
+    </div>
+    <div class="insight bad" id="f_ruleWarn" style="display:none"></div>
+    <div class="field-row">
+      <div class="field"><label>Fase <span class="hint">¿evaluación o fondeada?</span></label>
+        <input type="hidden" id="f_account" value="${(e.account||'').replace(/"/g,'&quot;')}">
+        <select id="f_phase" onchange="rebuildChecklist()">
+          ${(()=>{ const ph=e.id?tradePhase(e):(e.phase||lastTradePhase()); return `
+          <option value="eval" ${ph!=='funded'?'selected':''}>Evaluación</option>
+          <option value="funded" ${ph==='funded'?'selected':''}>Fondeada</option>`; })()}
+        </select>
+      </div>
+    </div>
+    ${copyHTML}
+    <div class="field-row-3">
+      <div class="field"><label>R planificado <span class="hint">tu objetivo</span></label><input type="number" id="f_plannedR" step="0.1" value="${e.plannedR??2}" oninput="checkHardRules()"></div>
+      <div class="field"><label>R realizado <span class="hint">lo que sacaste</span></label><input type="number" id="f_realizedR" step="0.1" value="${e.realizedR??''}" oninput="onRealizedRChange()" placeholder="-1 / 0 / 1.5"></div>
+      <div class="field"><label>Riesgo ($) <span class="hint">si es en varias cuentas, la suma</span></label><input type="number" id="f_riskUSD" value="${e.riskUSD??200}" oninput="onRealizedRChange()"></div>
+    </div>
+    <div class="calc-out" id="f_resultPreview" style="margin-bottom:14px;padding:12px 14px"></div>
+    <div class="hint" style="margin:-8px 0 14px">El <b>R planificado</b> es tu objetivo al entrar. Sirve para medir cuánto dejas sobre la mesa cuando cierras antes o te saltas el plan — es la base del "coste de la indisciplina".</div>
+    <div class="field"><label>P&L real ($) <span class="hint">se calcula solo, edítalo si el broker dio otra cifra</span></label>
+      <input type="number" id="f_pnl" value="${e.pnl??''}" placeholder="auto">
+    </div>
+    <div class="field"><label>¿Cómo saliste?</label>
+      <select id="f_exitType">
+        <option value="target" ${(e.exitType||'target')==='target'?'selected':''}>TP completo (llegué a mi objetivo)</option>
+        <option value="manual" ${e.exitType==='manual'?'selected':''}>Cierre manual (cerré antes del objetivo)</option>
+        <option value="be_moved" ${e.exitType==='be_moved'?'selected':''}>Movió BE y saltó (salí en ~0R)</option>
+        <option value="stop" ${e.exitType==='stop'?'selected':''}>SL (saltó el stop)</option>
+      </select>
+      <div class="hint" style="margin-top:5px">Lo que de verdad cuenta para tus métricas es el <b>R realizado</b> de arriba. Esto solo clasifica cómo cerraste.</div>
+    </div>
+    <div class="field-row">
+      <div class="field" id="f_dolWrap"><label>¿Llegó al objetivo final?</label>
+        <select id="f_dolReached">
+          <option value="" ${!e.dolReached?'selected':''}>— no registrado —</option>
+          <option value="yes" ${e.dolReached==='yes'?'selected':''}>Sí, llegó al objetivo final</option>
+          <option value="no" ${e.dolReached==='no'?'selected':''}>No, se quedó corto</option>
+        </select>
+      </div>
+      <div class="field"><label>Objetivo final en R <span class="hint">a cuántos R estaba la zona objetivo</span></label>
+        <input type="number" id="f_dolR" step="0.1" min="0" value="${e.dolR??''}" placeholder="ex. 2.0">
+      </div>
+    </div>
+    <div class="hint" style="margin:-6px 0 12px">Objetivo final en R = la distancia de la siguiente zona (o del alto/bajo del macro) respecto a tu entrada, en R. Lo sabes al entrar (distancia a la zona / distancia al stop). Es dónde estaba tu objetivo, no dónde llegó el precio.</div>
+    <div class="field"><label>R máximo alcanzado (MFE) <span class="hint">a favor</span></label>
+      <input type="number" id="f_mfe" step="0.1" value="${e.mfe??''}" placeholder="ex. 2.3">
+    </div>
+    <div class="hint" style="margin:-6px 0 12px">MFE = hasta qué R se movió el precio a tu favor, aunque no lo cobraras. <b>En un SL también importa</b>: te dice si acertaste dirección pero te sacaron, o si la entrada estaba mal.</div>
+    <div class="field"><label>R máximo en contra (MAE) <span class="hint">cuánto sufrió antes de resolverse</span></label>
+      <input type="number" id="f_mae" step="0.1" min="0" value="${e.mae??''}" placeholder="ex. 0.4">
+      <div class="hint" style="margin-top:5px">Cuánto se movió el precio EN CONTRA (en R positivos) antes de irse a favor o al stop. Sirve para saber si tu SL está demasiado lejos. Ej: si pusiste SL a 1R pero el precio solo fue 0,4R en contra antes de ganar, pon 0,4.</div>
+    </div>
+    <div class="field"><label>Flags de ejecución (marca lo que pasó)</label>
+      <div class="chips" id="f_flags">
+        ${Object.entries(FLAG_LABELS).map(([k,l])=>`<button type="button" class="chip ${flags.includes(k)?(k==='clean'?'on good':'on'):''}" data-flag="${k}" onclick="toggleFlag('${k}')">${l}</button>`).join('')}
+      </div>
+    </div>
+    <div class="field"><label>Nota</label><textarea id="f_note" rows="2" placeholder="Contexto, qué viste, qué harías distinto...">${e.note||''}</textarea></div>
+    <div class="field"><label>Capturas (gráficos, entradas...)</label>
+      <div class="img-drop" id="f_imgdrop" onclick="document.getElementById('f_imgInput').click()">📎 Toca para adjuntar imágenes (se comprimen solas)</div>
+      <input type="file" id="f_imgInput" accept="image/*" multiple style="display:none" onchange="handleTradeImages(event)">
+      <div class="thumb-row" id="f_thumbs"></div>
+    </div>
+    <div class="modal-actions">
+      ${t?`<button class="btn danger" onclick="deleteTrade('${t.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveTrade('${t?t.id:''}')">Guardar</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+  if(SIM){
+    // Simulado: sin cuenta, fase, riesgo, P&L ni flags de ejecución
+    const hide=el=>{ if(el&&el.style) el.style.display='none'; };
+    hide($('#f_account')?.closest?.('.field-row'));
+    hide($('#f_riskUSD')?.closest?.('.field'));
+    hide($('#f_pnl')?.closest?.('.field'));
+    hide($('#f_flags')?.closest?.('.field'));
+    hide($('#f_resultPreview'));
+  }
+  $('#modalBg')._flags=[...flags];
+  $('#modalBg')._images=[...(SIM?(e.images||[]):tradeImgs(e))];
+  $('#modalBg')._planChecked=[...planChecked];
+  $('#modalBg')._planCheckedOrig=[...planChecked];
+  $('#modalBg')._copySibIds=sibs.map(x=>x.id);
+  // Si el trade ya tenía un setup guardado, lo respetamos: no se recalcula solo al abrir.
+  // Los trades antiguos conservan su setup aunque se añadan reglas nuevas después.
+  $('#modalBg')._setupManual=!!(e.setup);
+  $('#modalBg')._isExisting=!!(e.id||e.setup);
+  renderTradeThumbs();
+  rebuildChecklist(true);
+  onRealizedRChange();
+  toggleMoveOther();
+  checkHardRules();
+}
+// Avisa en el formulario si el trade incumple las reglas de riesgo innegociables
+function checkHardRules(){
+  const w=$('#f_ruleWarn'); if(!w) return;
+  const pips=parseFloat($('#f_stopPips')?.value), rr=parseFloat($('#f_plannedR')?.value);
+  const msgs=[];
+  if(!isNaN(pips) && pips>200) msgs.push(`Stop de ${fmt(pips,0)} pips: más de 200. Según tu plan, esta operación <b>no se ejecuta</b>.`);
+  if(!isNaN(rr) && rr<2 && $('#f_entryType')?.value!=='dia_minimo') msgs.push(`R planificado ${fmt(rr,1)}: por debajo de 1:2. Según tu plan, <b>no se ejecuta</b>.`);
+  w.innerHTML=msgs.join('<br>');
+  w.style.display=msgs.length?'':'none';
+}
+
+// (Re)dibuja la checklist según el tipo de entrada y engancha el conteo + setup automático.
+// initial=true → apertura del modal: NO recalcula el setup si el trade ya tenía uno guardado
+// (así los trades antiguos conservan su setup aunque después se añadan reglas nuevas).
+function rebuildChecklist(initial){
+  const box=$('#f_plan'); if(!box) return;
+  const type=$('#f_entryType')?.value||'impulso';
+  const cPhase=checklistPhase();
+  const sess=$('#f_session')?.value||'';
+  const hintEl=$('#f_entryHint');
+  if(hintEl){
+    const md=type==='dia_minimo';
+    hintEl.style.display=md?'':'none';
+    hintEl.innerHTML=md?`📅 <b>Día mínimo</b>: no cuenta en tus estadísticas de trading (expectancy, win rate, setups, disciplina…). Va aparte en <b>Rendimiento → Días mínimos</b>. El dinero sí cuenta en el balance de la cuenta, el ROI y el calendario.${modalPhase()!=='funded'?' <span style="color:var(--amber)">⚠ Este trade no está en una cuenta fondeada.</span>':''}`:'';
+  }
+  const list=planChecklist(type, cPhase, sess);
+  const ownLen=planChecklist(type, modalPhase(), sess).length;
+  const saved=$('#modalBg')?._planChecked||[];
+  box.innerHTML=list.map((rule,i)=>`<label class="plan-item">
+    <input type="checkbox" data-plan="${i}" ${saved.includes(i)?'checked':''}>
+    <span>${rule}${i>=ownLen?' <span class="hint">(solo cuenta en las copias fondeadas)</span>':''}</span>
+  </label>`).join('');
+  // Muestra el conteo y (si procede) recalcula el setup automático.
+  // recalc=true solo cuando el usuario marca/desmarca una casilla o cambia el tipo de entrada.
+  const update=(recalc)=>{
+    const checks=$$('#f_plan input[type=checkbox]');
+    // El conteo y el setup son los de ESTA cuenta (la regla extra de fondeadas solo afecta a esas copias)
+    const checked=checks.filter((c,i)=>c.checked&&i<ownLen).length;
+    const total=ownLen;
+    $('#modalBg')._planChecked=checks.map((c,i)=>c.checked?i:-1).filter(i=>i>=0);
+    const idx=$('#modalBg')._planChecked.filter(i=>i<ownLen);
+    const nInneg=innegFailed(type, idx).length;
+    const autoS=autoSetupFor(type, idx, total);
+    const el=$('#f_planCount');
+    if(el) el.innerHTML=`<span class="${checked===total?'pos':checked>=total-1&&!nInneg?'':'neg'}">${checked}/${total} reglas cumplidas</span>${nInneg?' — <span class="neg">regla innegociable sin cumplir: según tu plan NO se ejecuta (setup C)</span>':checked<total?' — revisa antes de entrar':' ✓ todas cumplidas'}`;
+    const sel=$('#f_setup');
+    const auto=$('#f_setupAuto');
+    // El setup solo se recalcula automáticamente al tocar la checklist (recalc), nunca al abrir un trade existente.
+    if(recalc && sel){ sel.value='Setup '+autoS; $('#modalBg')._setupManual=false; }
+    if(auto) auto.innerHTML=`(auto: <b>${autoS}</b>)`;
+  };
+  // Al marcar/desmarcar una regla: sí recalcula el setup.
+  $$('#f_plan input[type=checkbox]').forEach(c=>c.addEventListener('change',()=>update(true)));
+  // Si el usuario elige el setup a mano, se respeta.
+  const sel=$('#f_setup');
+  if(sel) sel.addEventListener('change',()=>{ $('#modalBg')._setupManual=true; });
+  // Pintada: recalcula el setup solo si NO está fijado a mano ni es un trade existente con setup guardado.
+  update(!$('#modalBg')._setupManual);
+}
+
+// Deduce el resultado a partir del R realizado (single source of truth)
+// Mantra de procés: reforça centrar-se en el procés, no en el resultat.
+// t = trade guardat (o null si és un no-trade)
+function processMantra(t){
+  if(!t){
+    // no-trade
+    return "Hoy no ha hecho falta operar. Eso también es seguir el plan. 🧘";
+  }
+  const hasError=(t.flags||[]).some(f=>f!=='clean');
+  const isLoss=t.result==='loss';
+  if(!hasError){
+    if(isLoss) return "Has operado y ha sido stop, pero has seguido el plan. Eso es lo que cuenta. 💪";
+    return "Has operado y has seguido el plan a la perfección. 🔥";
+  } else {
+    return "Hoy no ha ido del todo bien, pero mejorará. El proceso por encima del resultado. 🌱";
+  }
+}
+function showMantra(msg){
+  const m=$('#mantra');
+  if(!m) return;
+  m.innerHTML=`<div class="m-text">${msg}</div><div class="m-sub">toca para cerrar</div>`;
+  m.classList.add('show');
+  m.style.pointerEvents='auto';
+  const close=()=>{ m.classList.remove('show'); m.style.pointerEvents='none'; m.onclick=null; clearTimeout(m._t); };
+  m.onclick=close;
+  clearTimeout(m._t); m._t=setTimeout(close,4000);
+}
+function resultFromR(r){
+  if(r==null||isNaN(r)) return null;
+  if(r>0) return 'win';
+  if(r<0) return 'loss';
+  return 'be';
+}
+
+// Muestra el campo de texto libre solo si el origen del movimiento es "otro"
+function toggleMoveOther(){
+  const sel=$('#f_moveType');
+  const inp=$('#f_moveOther');
+  if(!sel||!inp) return;
+  inp.style.display = sel.value==='other' ? '' : 'none';
+}
+// Mostra els detalls de l'SMT només si hi ha hagut entrada
+function toggleSmt(){
+  const sel=$('#f_smt');
+  const box=$('#f_smtDetails');
+  if(!sel||!box) return;
+  box.style.display = sel.value==='yes' ? '' : 'none';
+}
+// Al cambiar de cuenta, autoseleccionar su fase actual (si el usuario no ha forzado una)
+function onAccountChange(){
+  const acc=DB.accounts.find(a=>a.name===$('#f_account')?.value);
+  const ph=$('#f_phase');
+  if(acc && ph && !ph.value){ ph.value = acc.phase==='Funded'?'funded':'eval'; }
+  if($('#f_copies')) onCopyToggle(); // oculta la cuenta principal de la lista de copias (y redibuja la checklist)
+  else rebuildChecklist(); // la regla de cuentas fondeadas aparece/desaparece según la cuenta
+}
+function onRealizedRChange(){
+  const r=parseFloat($('#f_realizedR')?.value);
+  const risk=parseFloat($('#f_riskUSD')?.value)||0;
+  const res=resultFromR(r);
+  // preview del resultado deducido
+  const prev=$('#f_resultPreview');
+  if(prev){
+    if(res===null){
+      prev.innerHTML=`<span class="hint">Introduce el R realizado. <b>-1</b> = SL completo · <b>0</b> = break-even · <b>+1.5</b> = TP a 1:1,5</span>`;
+    } else {
+      const label=res==='win'?'GANADOR':res==='loss'?'PERDEDOR':'BREAK-EVEN';
+      const color=res==='win'?'var(--green)':res==='loss'?'var(--red)':'var(--ink-dim)';
+      const pnlCalc=r*risk;
+      prev.innerHTML=`<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+        <span style="font-weight:700;color:${color};font-size:13px;letter-spacing:.03em">${label}</span>
+        <span class="hint">${fmtR(r)} × ${fmt$(risk)} = <b style="color:${color}">${fmt$(pnlCalc)}</b></span>
+      </div>`;
+    }
+  }
+  // autorellenar P&L si está vacío o si coincidía con el cálculo anterior
+  const pnlEl=$('#f_pnl');
+  if(pnlEl && res!==null){
+    if(pnlEl.value==='' || pnlEl.dataset.auto==='1'){
+      pnlEl.value=(r*risk).toFixed(2);
+      pnlEl.dataset.auto='1';
+    }
+  }
+  toggleDolField();
+}
+
+// Amaga el camp del objetivo final quan el trade és perdedor (un SL mai arriba al objetivo final,
+// així que registrar-ho embrutaria l'estadística sense aportar res)
+function toggleDolField(){
+  const r=parseFloat($('#f_realizedR')?.value);
+  const res=resultFromR(r);
+  const wrap=$('#f_dolWrap');
+  if(!wrap) return;
+  if(res==='loss'){
+    wrap.style.display='none';
+    const sel=$('#f_dolReached'); if(sel) sel.value='';
+  } else {
+    wrap.style.display='';
+  }
+}
+
+// Comprime una imagen a max 1000px lado mayor, JPEG 0.7 (~100-200KB)
+function compressImage(file){
+  return new Promise((resolve)=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      const img=new Image();
+      img.onload=()=>{
+        const max=1600;   // en la nube hay espacio: capturas más nítidas
+        let {width,height}=img;
+        if(width>max||height>max){
+          if(width>height){ height=height*max/width; width=max; }
+          else { width=width*max/height; height=max; }
+        }
+        const canvas=document.createElement('canvas');
+        canvas.width=width; canvas.height=height;
+        canvas.getContext('2d').drawImage(img,0,0,width,height);
+        resolve(canvas.toDataURL('image/jpeg',0.82));
+      };
+      img.src=e.target.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+async function handleTradeImages(ev){
+  const files=[...ev.target.files];
+  for(const f of files){
+    if(!f.type.startsWith('image/')) continue;
+    const compressed=await compressImage(f);
+    $('#modalBg')._images.push(compressed);
+  }
+  renderTradeThumbs();
+  ev.target.value='';
+}
+function renderTradeThumbs(){
+  const imgs=$('#modalBg')._images||[];
+  const c=$('#f_thumbs');
+  if(!c) return;
+  c.innerHTML=imgs.map((src,i)=>`<div style="position:relative">
+    <img class="thumb" ${imgAttrs(src)}>
+    <button onclick="removeTradeImage(${i})" style="position:absolute;top:-6px;right:-6px;background:var(--red);color:#fff;border:none;border-radius:50%;width:20px;height:20px;font-size:12px;cursor:pointer;line-height:1">×</button>
+  </div>`).join('');
+  // lightbox por índice (evita meter base64 gigante en onclick)
+  $$('#f_thumbs .thumb').forEach((el,i)=>{ el.onclick=()=>lightbox(imgs[i]); });
+}
+function removeTradeImage(i){
+  $('#modalBg')._images.splice(i,1);
+  renderTradeThumbs();
+}
+function _modalImagesEnd(){}
+function toggleFlag(k){
+  const fl=$('#modalBg')._flags;
+  if(k==='clean'){ $('#modalBg')._flags=['clean']; }
+  else {
+    const i=fl.indexOf(k);
+    if(i>=0) fl.splice(i,1); else { fl.push(k); const ci=fl.indexOf('clean'); if(ci>=0)fl.splice(ci,1); }
+    if(!fl.length) fl.push('clean');
+  }
+  // refresh chips
+  $$('#f_flags .chip').forEach(c=>{
+    const fk=c.dataset.flag, on=$('#modalBg')._flags.includes(fk);
+    c.className='chip'+(on?(fk==='clean'?' on good':' on'):'');
+  });
+}
+function saveTrade(id){
+  const flags=$('#modalBg')._flags;
+  const realizedR=parseFloat($('#f_realizedR').value);
+  const SIM=TRADE_MODE==='sim';
+  if(SIM) DB.paperTrades=DB.paperTrades||[];
+  const STORE=SIM?DB.paperTrades:DB.trades;
+  const existing=id?STORE.find(x=>x.id===id):null;
+  const newChecked=$$('#f_plan input[type=checkbox]').filter(c=>c.checked).map(c=>+c.dataset.plan);
+  const newEntryType=$('#f_entryType')?.value||'impulso';
+  // Si editas un trade antiguo sin tocar su checklist, conserva su nº de reglas original.
+  const newPhase=modalPhase();
+  const origView=$('#modalBg')._planCheckedOrig||existing?.planChecked||[];
+  const checklistUntouched = existing && JSON.stringify([...origView].sort((a,b)=>a-b))===JSON.stringify([...newChecked].sort((a,b)=>a-b)) && (existing.entryType||'impulso')===newEntryType && (tradePhase(existing)||'')===(newPhase||'') && (newPhase!=='funded' || (existing.session||'')===($('#f_session').value||''));
+  // Checklist / setup de cada cuenta según su fase (la regla de fondeadas solo cuenta en fondeadas)
+  const setupSel=$('#f_setup').value;
+  const setupAuto=!$('#modalBg')._setupManual;
+  const planFor=ph=>{ const tot=planChecklist(newEntryType,ph,$('#f_session').value).length; const ch=newChecked.filter(i=>i<tot); return {planChecked:ch, planTotal:tot, setup: setupAuto?'Setup '+autoSetupFor(newEntryType,ch,tot):setupSel}; };
+  const own=planFor(newPhase);
+  const t={
+    id:id||uid(),
+    date:$('#f_date').value,
+    symbol:$('#f_symbol').value.trim().toUpperCase(),
+    setup: checklistUntouched ? setupSel : own.setup,
+    session:$('#f_session').value,
+    moveType:$('#f_moveType').value,
+    moveOther:$('#f_moveType').value==='other'?$('#f_moveOther').value.trim():'',
+    direction:$('#f_direction')?.value||'',
+    zone:$('#f_zone')?.value||'',
+    targetType:$('#f_targetType')?.value||'',
+    stopPips:parseFloat($('#f_stopPips')?.value),
+    // SMT ya no se pregunta; se conservan los datos de trades antiguos
+    smt:existing?.smt||'',
+    smtResult:existing?.smtResult||'',
+    smtTiming:existing?.smtTiming||'',
+    account:$('#f_account').value,
+    phase: $('#f_phase').value || (()=>{ const acc=DB.accounts.find(a=>a.name===$('#f_account').value); return acc? (acc.phase==='Funded'?'funded':'eval') : ''; })(),
+    plannedR:parseFloat($('#f_plannedR').value)||0,
+    realizedR:isNaN(realizedR)?0:realizedR,
+    riskUSD:parseFloat($('#f_riskUSD').value)||0,
+    pnl:parseFloat($('#f_pnl').value)|| ((isNaN(realizedR)?0:realizedR)*(parseFloat($('#f_riskUSD').value)||0)),
+    result:resultFromR(realizedR)||'be',
+    exitType:$('#f_exitType').value,
+    result11:existing?.result11||'',
+    dolReached:$('#f_dolReached').value,
+    dolR:parseFloat($('#f_dolR').value),
+    mfe:parseFloat($('#f_mfe').value),
+    mae:parseFloat($('#f_mae').value),
+    flags:[...flags],
+    note:$('#f_note').value.trim(),
+    images:[...($('#modalBg')._images||[])],
+    planChecked: checklistUntouched ? (existing.planChecked||[]) : own.planChecked,
+    entryType:newEntryType,
+    planTotal: checklistUntouched ? existing.planTotal : own.planTotal
+  };
+  // Reglas innegociables sin cumplir → se marca el error automáticamente (el trade no debía existir)
+  if(!SIM && !isMinDay(t)){
+    const miss=innegFailed(newEntryType,newChecked).map(i=>INNEG_FLAGS[i]);
+    // Aunque la casilla esté marcada, los números mandan: stop de más de 200 pips o R planificado por debajo de 2
+    if(!isNaN(t.stopPips) && t.stopPips>200 && !miss.includes('sl_over')) miss.push('sl_over');
+    if(t.plannedR>0 && t.plannedR<2 && !miss.includes('rr_low')) miss.push('rr_low');
+    if(miss.length){
+      t.setup='Setup C';
+      t.flags=t.flags.filter(f=>f!=='clean');
+      miss.forEach(f=>{ if(!t.flags.includes(f)) t.flags.push(f); });
+    }
+  }
+  if(SIM){ Object.assign(t,{sim:true,account:'',phase:'',riskUSD:0,pnl:0,flags:['clean'],planChecked:newChecked,planTotal:planChecklist(newEntryType,'').length,setup:setupSel}); }
+  // ---- Copias en otras cuentas (solo trades reales) ----
+  const before=SIM?null:DB.trades.slice();
+  let nSync=0, nNew=0;
+  if(!SIM){
+    const sibs=existing?copySiblings(existing):[];
+    if(t.account && sibs.some(x=>x.account===t.account)){ toast('⚠ Ya hay una copia de este trade en '+t.account+'. Elige otra cuenta.'); return; }
+    const copies=modalCopies().filter(c=>!sibs.some(x=>x.account===c.acc.name));
+    if(existing?.copyGroup) t.copyGroup=existing.copyGroup;
+    if(copies.length && !t.copyGroup) t.copyGroup=uid();
+    // Campos comunes: todo lo del trade salvo cuenta, fase, riesgo, P&L, checklist/setup (por fase) e imágenes
+    const common=x=>{ const c={...x}; ['id','account','phase','riskUSD','pnl','planChecked','planTotal','setup','images','copyGroup'].forEach(k=>delete c[k]); return c; };
+    // Sincroniza las copias existentes (objetos nuevos: si falla el guardado se restaura todo)
+    sibs.forEach(sb=>{
+      const autoPnl=Math.abs((sb.pnl||0)-(sb.realizedR||0)*(sb.riskUSD||0))<0.01;
+      const u={...sb, ...common(t)};
+      u.pnl = autoPnl ? t.realizedR*(sb.riskUSD||0) : sb.pnl;
+      if(checklistUntouched){ if(setupSel!==(existing.setup||'')) u.setup=setupSel; }
+      else Object.assign(u, planFor(tradePhase(sb)));
+      // las capturas del grupo se cargaron en el formulario y ahora viven solo en el trade que editas
+      u.images=[];
+      const i=DB.trades.findIndex(x=>x.id===sb.id); DB.trades[i]=u; nSync++;
+    });
+    copies.forEach(c=>{
+      const ph=c.acc.phase==='Funded'?'funded':'eval';
+      DB.trades.push({...common(t), id:uid(), copyGroup:t.copyGroup, account:c.acc.name, phase:ph,
+        riskUSD:c.risk, pnl: isNaN(c.pnl) ? t.realizedR*c.risk : c.pnl, images:[], ...planFor(ph)});
+      nNew++;
+    });
+  }
+  if(id){ const i=STORE.findIndex(x=>x.id===id); STORE[i]=t; }
+  else STORE.push(t);
+  try{
+    save();
+  }catch(err){
+    // localStorage lleno (probablemente por imágenes)
+    toast('⚠ Almacenamiento lleno. Quita alguna imagen o exporta y limpia datos antiguos.');
+    if(SIM){ if(!id) STORE.pop(); }
+    else DB.trades=before;
+    return;
+  }
+  closeModal(); render();
+  const cp=(nSync?` · ${nSync} copia${nSync>1?'s':''} sincronizada${nSync>1?'s':''}`:'')+(nNew?` · añadido a ${nNew} cuenta${nNew>1?'s':''} más`:'');
+  if(SIM){ toast(id?'Simulado actualizado':'Trade simulado guardado'); }
+  else if(id){ toast('Trade actualizado'+cp); }
+  else { showMantra(processMantra(t)); if(nNew) toast(`Trade guardado en ${nNew+1} cuentas`); }
+}
+function deleteTrade(id){
+  if(TRADE_MODE==='sim'){
+    if(!confirm('¿Eliminar este trade simulado?'))return;
+    DB.paperTrades=(DB.paperTrades||[]).filter(t=>t.id!==id); save(); closeModal(); render(); toast('Simulado eliminado');
+    return;
+  }
+  const tr=DB.trades.find(t=>t.id===id);
+  const sibs=copySiblings(tr);
+  if(sibs.length){
+    const names=sibs.map(x=>x.account||'sin cuenta').join(', ');
+    if(confirm(`Este trade también está copiado en: ${names}.\n\nAceptar → eliminar el trade de TODAS las cuentas (${sibs.length+1}).\nCancelar → elegir otra opción.`)){
+      const g=tr.copyGroup;
+      DB.trades=DB.trades.filter(t=>t.copyGroup!==g); save(); closeModal(); render(); toast(`Trade eliminado de ${sibs.length+1} cuentas`);
+      return;
+    }
+    if(!confirm(`¿Eliminar solo la copia de ${tr.account||'esta cuenta'}? (se mantiene en ${names})`)) return;
+    // Las capturas del grupo no se pierden: pasan a otra copia
+    const imgs=(tr.images&&tr.images.length)?tr.images:null;
+    DB.trades=DB.trades.filter(t=>t.id!==id).map(t=>{
+      if(t.copyGroup!==tr.copyGroup) return t;
+      let u=t;
+      if(imgs && t.id===sibs[0].id) u={...u, images:imgs};
+      if(sibs.length===1){ u={...u}; delete u.copyGroup; }
+      return u;
+    });
+    save(); closeModal(); render(); toast('Copia eliminada');
+    return;
+  }
+  if(!confirm('¿Eliminar este trade?'))return;
+  DB.trades=DB.trades.filter(t=>t.id!==id); save(); closeModal(); render(); toast('Trade eliminado');
+}
+
+/* ============================================================
+   MODAL — ACCOUNT
+   ============================================================ */
+function openAccountModal(){ accountModal(); }
+function editAccount(id){ accountModal(DB.accounts.find(a=>a.id===id)); }
+function accountModal(a){
+  const e=a||{};
+  const firms=Object.keys(DB.firms||{});
+  const curFirm=e.firm||firms[0]||'LucidFlex';
+  const plans=DB.firms[curFirm]?Object.keys(DB.firms[curFirm].plans):[];
+  const curPlan=e.plan||plans[0]||'';
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${a?'Editar cuenta':'Nueva cuenta'} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="field"><label>Nombre/alias</label><input id="a_name" value="${e.name||''}" placeholder="${curFirm} ${curPlan} #1"></div>
+    <div class="field-row-3">
+      <div class="field"><label>Firma</label><select id="a_firm" onchange="acctFirmChange()">
+        ${firms.map(f=>`<option ${curFirm===f?'selected':''}>${f}</option>`).join('')}
+      </select></div>
+      <div class="field"><label>Plan</label><select id="a_plan" onchange="acctPreview()">
+        ${plans.map(p=>`<option ${curPlan===p?'selected':''}>${p}</option>`).join('')}
+      </select></div>
+      <div class="field"><label>Fase</label><select id="a_phase" onchange="acctPreview()">
+        ${['Evaluación','Funded'].map(p=>`<option ${e.phase===p?'selected':''}>${p}</option>`).join('')}
+      </select></div>
+    </div>
+    <div class="field"><label>Estado <span class="hint">para la estadística de cuentas</span></label>
+      <select id="a_status">
+        ${[['en_curso','En curso'],['pasada','Pasada'],['fondeada','Fondeada'],['payout','Con payout'],['perdida','Perdida']].map(([v,l])=>`<option value="${v}" ${(e.status||'en_curso')===v?'selected':''}>${l}</option>`).join('')}
+      </select>
+    </div>
+    <div id="a_preview" style="display:none"></div>
+    <div class="modal-actions">
+      ${a?`<button class="btn danger" onclick="deleteAccount('${a.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveAccount('${a?a.id:''}')">Guardar</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+  acctPreview();
+}
+function acctFirmChange(){
+  const firm=$('#a_firm').value;
+  const plans=DB.firms[firm]?Object.keys(DB.firms[firm].plans):[];
+  $('#a_plan').innerHTML=plans.map(p=>`<option>${p}</option>`).join('');
+  acctPreview();
+}
+function acctPreview(){
+  const firm=$('#a_firm').value, plan=$('#a_plan').value, phase=$('#a_phase').value;
+  const s=planSpec(firm,plan,phase);
+  if(!s){ $('#a_preview').innerHTML='<p class="hint">Plan sin reglas definidas.</p>'; return; }
+  $('#a_preview').innerHTML=`<div class="grid g-2" style="gap:8px">
+    <div class="hint">Balance: <b style="color:var(--ink)">${fmt$(s.size)}</b></div>
+    <div class="hint">Drawdown (trailing EOD): <b style="color:var(--ink)">${fmt$(s.drawdown)}</b></div>
+    ${s.profitTarget?`<div class="hint">Profit target: <b style="color:var(--ink)">${fmt$(s.profitTarget)}</b></div>`:'<div class="hint">Sin profit target (funded)</div>'}
+    ${s.dailyLoss?`<div class="hint">Daily loss limit: <b style="color:var(--red)">${fmt$(s.dailyLoss)}</b></div>`:'<div class="hint">Sin daily loss limit</div>'}
+    <div class="hint">Máx contratos: <b style="color:var(--ink)">${s.maxMicro} micros / ${s.maxMini} minis</b></div>
+    ${s.consistency?`<div class="hint">Consistency: <b style="color:var(--ink)">${s.consistency}%</b></div>`:'<div class="hint">Sin consistency</div>'}
+    ${s.minDays?`<div class="hint">Mín. días: <b style="color:var(--ink)">${s.minDays}</b></div>`:''}
+  </div>`;
+}
+function saveAccount(id){
+  const firm=$('#a_firm').value, plan=$('#a_plan').value, phase=$('#a_phase').value;
+  const s=planSpec(firm,plan,phase)||{};
+  const prev=id?DB.accounts.find(x=>x.id===id):null;
+  const a={
+    id:id||uid(),
+    name:$('#a_name').value.trim()||`${firm} ${plan}`,
+    firm, plan, phase,
+    status:$('#a_status').value,
+    size:s.size||prev?.size||0,
+    startBalance:s.size||prev?.startBalance||0
+  };
+  if(id){const i=DB.accounts.findIndex(x=>x.id===id);DB.accounts[i]=a;}
+  else DB.accounts.push(a);
+  save(); closeModal(); render(); toast(id?'Cuenta actualizada':'Cuenta añadida');
+}
+function deleteAccount(id){
+  if(!confirm('¿Eliminar esta cuenta?'))return;
+  DB.accounts=DB.accounts.filter(a=>a.id!==id); save(); closeModal(); render(); toast('Cuenta eliminada');
+}
+// Reajustar el balance de una cuenta a mano (p.ej. tras un payout, el dinero sale de la cuenta)
+function adjustBalance(id){
+  const a=DB.accounts.find(x=>x.id===id); if(!a) return;
+  const allAcctTrades=DB.trades.filter(t=>t.account===a.name);
+  const aTrades = a.phase==='Funded'
+    ? allAcctTrades.filter(t=>tradePhase(t)==='funded')
+    : allAcctTrades;
+  const realized=totalPnl(aTrades);
+  const currentBalance=(a.startBalance||0)+realized;
+  const input=prompt(`Balance actual de "${a.name}": ${fmt$(currentBalance)}\n\nEscribe el NUEVO balance tras el payout (el dinero retirado sale de la cuenta):`, Math.round(currentBalance));
+  if(input===null) return;
+  const nb=parseFloat(input);
+  if(isNaN(nb)||nb<0){ toast('Balance no válido'); return; }
+  // ajustamos startBalance para que startBalance + realized = nuevo balance
+  a.startBalance = nb - realized;
+  save(); render(); toast('Balance reajustado');
+}
+
+// ---- Costes y payouts ----
+function openCostModal(){ costModal(); }
+function editCost(id){ costModal((DB.propCosts||[]).find(c=>c.id===id)); }
+function costModal(c){
+  const e=c||{};
+  const firms=Object.keys(DB.firms||{});
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${c?'Editar coste':'Nuevo coste'} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="field-row">
+      <div class="field"><label>Fecha</label><input type="date" id="c_date" value="${e.date||todayISO()}"></div>
+      <div class="field"><label>Importe ($)</label><input type="number" id="c_amount" step="0.01" value="${e.amount??''}" placeholder="ex. 165"></div>
+    </div>
+    <div class="field"><label>Concepto</label><input id="c_concept" value="${e.concept||''}" placeholder="ex. Eval 50K LucidFlex, reset, activación..."></div>
+    <div class="field"><label>Firma <span class="hint">(opcional)</span></label>
+      <select id="c_firm"><option value="">—</option>${firms.map(f=>`<option ${e.firm===f?'selected':''}>${f}</option>`).join('')}</select>
+    </div>
+    <div class="modal-actions">
+      ${c?`<button class="btn danger" onclick="deleteCost('${c.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveCost('${c?c.id:''}')">Guardar</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+}
+function saveCost(id){
+  const amount=parseFloat($('#c_amount').value);
+  if(isNaN(amount)||amount<=0){ toast('Pon un importe válido'); return; }
+  const c={ id:id||uid(), date:$('#c_date').value||todayISO(), amount, concept:$('#c_concept').value.trim(), firm:$('#c_firm').value };
+  DB.propCosts=DB.propCosts||[];
+  if(id){const i=DB.propCosts.findIndex(x=>x.id===id);DB.propCosts[i]=c;}
+  else DB.propCosts.push(c);
+  save(); closeModal(); render(); toast(id?'Coste actualizado':'Coste añadido');
+}
+function deleteCost(id){
+  if(!confirm('¿Eliminar este coste?'))return;
+  DB.propCosts=(DB.propCosts||[]).filter(c=>c.id!==id); save(); closeModal(); render(); toast('Coste eliminado');
+}
+function openPayoutModal(){ payoutModal(); }
+function editPayout(id){ payoutModal((DB.payouts||[]).find(p=>p.id===id)); }
+function payoutModal(p){
+  const e=p||{};
+  const firms=Object.keys(DB.firms||{});
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${p?'Editar payout':'Nuevo payout'} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="field-row">
+      <div class="field"><label>Fecha</label><input type="date" id="p_date" value="${e.date||todayISO()}"></div>
+      <div class="field"><label>Importe ($)</label><input type="number" id="p_amount" step="0.01" value="${e.amount??''}" placeholder="ex. 1500"></div>
+    </div>
+    <div class="field"><label>Concepto <span class="hint">(opcional)</span></label><input id="p_concept" value="${e.concept||''}" placeholder="ex. 1er payout Lucid Funded"></div>
+    <div class="field"><label>Firma <span class="hint">(opcional)</span></label>
+      <select id="p_firm"><option value="">—</option>${firms.map(f=>`<option ${e.firm===f?'selected':''}>${f}</option>`).join('')}</select>
+    </div>
+    <div class="modal-actions">
+      ${p?`<button class="btn danger" onclick="deletePayout('${p.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="savePayout('${p?p.id:''}')">Guardar</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+}
+function savePayout(id){
+  const amount=parseFloat($('#p_amount').value);
+  if(isNaN(amount)||amount<=0){ toast('Pon un importe válido'); return; }
+  const p={ id:id||uid(), date:$('#p_date').value||todayISO(), amount, concept:$('#p_concept').value.trim(), firm:$('#p_firm').value };
+  DB.payouts=DB.payouts||[];
+  if(id){const i=DB.payouts.findIndex(x=>x.id===id);DB.payouts[i]=p;}
+  else DB.payouts.push(p);
+  save(); closeModal(); render(); toast(id?'Payout actualizado':'Payout añadido');
+}
+function deletePayout(id){
+  if(!confirm('¿Eliminar este payout?'))return;
+  DB.payouts=(DB.payouts||[]).filter(p=>p.id!==id); save(); closeModal(); render(); toast('Payout eliminado');
+}
+
+function closeModal(){ $('#modalBg').classList.remove('show'); $('#modalBg').innerHTML=''; }
+
+/* ============================================================
+   EDITOR DE REGLAS DE FIRMAS
+   ============================================================ */
+let FE_FIRM=null, FE_PLAN=null;
+function openFirmEditor(){
+  const firms=Object.keys(DB.firms||{});
+  FE_FIRM=FE_FIRM&&DB.firms[FE_FIRM]?FE_FIRM:firms[0];
+  const plans=FE_FIRM?Object.keys(DB.firms[FE_FIRM].plans):[];
+  FE_PLAN=FE_PLAN&&plans.includes(FE_PLAN)?FE_PLAN:plans[0];
+  $('#modalBg').innerHTML=`<div class="modal" style="max-width:640px">
+    <h2>⚙ Editar reglas de firmas <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="field-row">
+      <div class="field"><label>Firma</label><select id="fe_firm" onchange="feSelectFirm(this.value)">
+        ${firms.map(f=>`<option ${FE_FIRM===f?'selected':''}>${f}</option>`).join('')}
+      </select></div>
+      <div class="field" style="display:flex;align-items:flex-end;gap:8px">
+        <button class="btn ghost sm" onclick="feAddFirm()">+ Firma</button>
+        ${firms.length>1?`<button class="btn danger sm" onclick="feDeleteFirm()">Borrar firma</button>`:''}
+      </div>
+    </div>
+    ${FE_FIRM?`
+    <div class="field-row">
+      <div class="field"><label>Plan</label><select id="fe_plan" onchange="feSelectPlan(this.value)">
+        ${plans.map(p=>`<option ${FE_PLAN===p?'selected':''}>${p}</option>`).join('')}
+      </select></div>
+      <div class="field" style="display:flex;align-items:flex-end;gap:8px">
+        <button class="btn ghost sm" onclick="feAddPlan()">+ Plan</button>
+        ${plans.length>1?`<button class="btn danger sm" onclick="feDeletePlan()">Borrar plan</button>`:''}
+      </div>
+    </div>
+    <div id="fe_planForm">${FE_PLAN?fePlanForm():''}</div>
+    `:'<p class="hint">Añade una firma para empezar.</p>'}
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeModal()">Cerrar</button>
+      ${FE_PLAN?`<button class="btn primary" onclick="feSavePlan()">Guardar plan</button>`:''}
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+}
+function fePlanForm(){
+  const p=DB.firms[FE_FIRM].plans[FE_PLAN];
+  const trailing=DB.firms[FE_FIRM].trailing||'eod';
+  const f=(phase,field,def=0)=> (p[phase]&&p[phase][field]!=null)?p[phase][field]:def;
+  const phaseFields=(phase,label)=>`
+    <div class="plan-box" style="margin-bottom:12px">
+      <div class="plan-title">${label}</div>
+      <div class="field-row-3">
+        <div class="field"><label>Profit target ($)</label><input type="number" id="fe_${phase}_profitTarget" value="${f(phase,'profitTarget')}"></div>
+        <div class="field"><label>Drawdown ($)</label><input type="number" id="fe_${phase}_drawdown" value="${f(phase,'drawdown')}"></div>
+        <div class="field"><label>Daily loss ($, 0=no)</label><input type="number" id="fe_${phase}_dailyLoss" value="${f(phase,'dailyLoss')}"></div>
+      </div>
+      <div class="field-row-3">
+        <div class="field"><label>Trail lock ($, 0=no)</label><input type="number" id="fe_${phase}_trailLock" value="${f(phase,'trailLock')}"></div>
+        <div class="field"><label>Suelo bloqueado ($)</label><input type="number" id="fe_${phase}_lockedFloor" value="${f(phase,'lockedFloor')}"></div>
+        <div class="field"><label>Consistency (%, 0=no)</label><input type="number" id="fe_${phase}_consistency" value="${f(phase,'consistency')}"></div>
+      </div>
+      <div class="field-row-3">
+        <div class="field"><label>Máx micros</label><input type="number" id="fe_${phase}_maxMicro" value="${f(phase,'maxMicro')}"></div>
+        <div class="field"><label>Máx minis</label><input type="number" id="fe_${phase}_maxMini" value="${f(phase,'maxMini')}"></div>
+        <div class="field"><label>Mín. días</label><input type="number" id="fe_${phase}_minDays" value="${f(phase,'minDays',1)}"></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Mín. profit/día ($)</label><input type="number" id="fe_${phase}_minDailyProfit" value="${f(phase,'minDailyProfit')}"></div>
+        <div class="field"><label>Cap payout ($, 0=no)</label><input type="number" id="fe_${phase}_payoutCap" value="${f(phase,'payoutCap')}"></div>
+      </div>
+    </div>`;
+  return `
+    <div class="field"><label>Balance del plan ($)</label><input type="number" id="fe_size" value="${p.size||0}"></div>
+    ${phaseFields('eval','FASE EVALUACIÓN')}
+    ${phaseFields('funded','FASE FUNDED')}
+    <div class="hint">Todas trailing EOD. Deja en 0 lo que no aplique (p.ej. sin daily loss, sin consistency, sin trail lock).</div>
+  `;
+}
+function feSelectFirm(name){ FE_FIRM=name; FE_PLAN=null; openFirmEditor(); }
+function feSelectPlan(name){ FE_PLAN=name; openFirmEditor(); }
+function feAddFirm(){
+  const name=prompt('Nombre de la firma nueva:');
+  if(!name) return;
+  if(DB.firms[name]){ toast('Ya existe'); return; }
+  DB.firms[name]={trailing:'eod',plans:{}};
+  FE_FIRM=name; FE_PLAN=null; save(); openFirmEditor();
+}
+function feDeleteFirm(){
+  if(!confirm(`¿Borrar la firma ${FE_FIRM} y todos sus planes?`))return;
+  delete DB.firms[FE_FIRM]; FE_FIRM=null; FE_PLAN=null; save(); openFirmEditor();
+}
+function feAddPlan(){
+  const name=prompt('Nombre del plan (ej. 50K, Starter 50K...):');
+  if(!name) return;
+  if(DB.firms[FE_FIRM].plans[name]){ toast('Ya existe'); return; }
+  const blank={profitTarget:0,drawdown:0,trailLock:0,lockedFloor:0,dailyLoss:0,maxMicro:0,maxMini:0,minDays:1,consistency:0,minDailyProfit:0,payoutCap:0};
+  DB.firms[FE_FIRM].plans[name]={size:0,eval:structuredClone(blank),funded:structuredClone(blank)};
+  FE_PLAN=name; save(); openFirmEditor();
+}
+function feDeletePlan(){
+  if(!confirm(`¿Borrar el plan ${FE_PLAN}?`))return;
+  delete DB.firms[FE_FIRM].plans[FE_PLAN]; FE_PLAN=null; save(); openFirmEditor();
+}
+function feSavePlan(){
+  const p=DB.firms[FE_FIRM].plans[FE_PLAN];
+  p.size=+$('#fe_size').value||0;
+  ['eval','funded'].forEach(phase=>{
+    p[phase]=p[phase]||{};
+    ['profitTarget','drawdown','dailyLoss','trailLock','lockedFloor','consistency','maxMicro','maxMini','minDays','minDailyProfit','payoutCap'].forEach(field=>{
+      p[phase][field]=+$(`#fe_${phase}_${field}`).value||0;
+    });
+  });
+  save(); toast('Plan guardado'); render();
+}
+
+/* ============================================================
+   IMPORT / EXPORT
+   ============================================================ */
+// Copia de seguridad COMPLETA: incluye las capturas dentro del JSON (se descargan de la nube)
+async function exportData(){
+  toast('Preparando copia de seguridad (con capturas)…');
+  const copy=JSON.parse(JSON.stringify(DB));
+  let fail=0;
+  try{ if(typeof Cloud!=='undefined') fail=await Cloud.inlineImages(copy); }catch(e){ fail=-1; }
+  const blob=new Blob([JSON.stringify(copy,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=`crtdesk-${todayISO()}.json`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),2000);
+  toast(fail?'⚠ Exportado, pero sin algunas capturas (¿sin conexión?)':'Copia exportada (con capturas)');
+}
+function importData(file){
+  const r=new FileReader();
+  r.onload=()=>{
+    try{ const d=JSON.parse(r.result);
+      if(!d.trades){ toast('Archivo inválido'); return; }
+      if(!confirm(`Importar este archivo SUSTITUYE tu journal actual (en la nube y en todos tus dispositivos) por el del archivo (${d.trades.length} trades).\n\n¿Continuar?`)) return;
+      DB=normalizeDB(d);
+      save(); render(); toast('Datos importados · subiendo a la nube');
+    }catch(e){ toast('Archivo inválido'); }
+  };
+  r.readAsText(file);
+}
+
+// Genera un informe de texto limpio (sin imágenes) para pegar en un chat de IA
+function buildAIReport(){
+  // Informe completo en texto plano pensado para que otra IA lo lea y lo analice.
+  // Usa EXACTAMENTE las mismas funciones de cálculo que el dashboard.
+  const ALL=[...DB.trades].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  const T=ALL.filter(t=>!isMinDay(t));     // trading normal
+  const MD=ALL.filter(isMinDay);           // días mínimos de fondeadas: van aparte (sección 7)
+  const NT=[...(DB.noTradeDays||[])].sort((a,b)=> a.date<b.date?-1:1);
+  const L=[];
+  const pct=v=>fmt(v,1)+'%';
+  const pfTxt=arr=>{ const p=profitFactor(arr); return p===Infinity?'∞':fmt(p,2); };
+  const num=(x,d=2)=> (x==null||isNaN(x))?'—':fmt(x,d);
+  const isErr=t=>(t.flags||[]).some(f=>f!=='clean');
+  // Si no hay trades (o solo BE), mostrar "—" en vez de 0 para no confundir a la IA
+  const expT=arr=>arr.length?fmtR(expectancy(arr)):'—';
+  const wrT=arr=>arr.some(t=>t.result==='win'||t.result==='loss')?pct(winrate(arr)):'—';
+  const DOW=['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+  const dow=d=>{ const [y,m,dd]=d.split('-').map(Number); return DOW[new Date(y,m-1,dd).getDay()]; };
+  const EXIT_LABELS={target:'TP completo',manual:'Cierre manual antes del TP',be_moved:'Movió a BE y saltó',stop:'SL (saltó el stop)'};
+  const STATUS_LABELS={en_curso:'En curso',pasada:'Pasada',fondeada:'Fondeada',payout:'Con payout',perdida:'Perdida (quemada)'};
+  const months=[...new Set(T.map(t=>t.date.slice(0,7)).concat(NT.map(n=>n.date.slice(0,7))))].sort();
+  const line=()=>L.push('');
+  // Copias: un mismo trade tomado en varias cuentas (cada copia cuenta como un trade)
+  const tIdx=new Map(T.map((t,i)=>[t.id,i]));
+  const uniqN=arr=>new Set(arr.map(t=>t.copyGroup||t.id)).size;
+  const copiedN=arr=>arr.filter(t=>t.copyGroup&&copySiblings(t).length).length;
+
+  // ---------- Bloque de estadísticas (se usa para el total y para cada mes) ----------
+  const statsBlock=(arr)=>{
+    if(!arr.length){ L.push('Sin trades.'); return; }
+    const W=arr.filter(t=>t.result==='win'), Ls=arr.filter(t=>t.result==='loss'), B=arr.filter(t=>t.result==='be');
+    const risks=arr.map(t=>t.riskUSD).filter(x=>x>0);
+    L.push(`Trades: ${arr.length} (${W.length} ganadores, ${Ls.length} perdedores, ${B.length} BE) · días operados: ${new Set(arr.map(t=>t.date)).size}${uniqN(arr)!==arr.length?` · decisiones únicas: ${uniqN(arr)} (${copiedN(arr)} registros son copias del mismo trade en varias cuentas)`:''}`);
+    L.push(`Expectancy: ${fmtR(expectancy(arr))} por trade · Win rate: ${wrT(arr)} · Profit factor: ${pfTxt(arr)}`);
+    L.push(`Avg win: ${fmtR(avgWin(arr))} · Avg loss: ${fmtR(avgLoss(arr))} · R total: ${fmtR(totalR(arr))} · P&L: ${fmt$(totalPnl(arr))} · Riesgo medio por trade: ${risks.length?fmt$(risks.reduce((a,b)=>a+b,0)/risks.length):'—'}`);
+    const st=streaks(arr);
+    L.push(`Max drawdown: -${num(maxDrawdownR(arr))}R · Racha récord: ${st.maxWin} victorias / ${st.maxLoss} derrotas · Racha al final del periodo: ${st.curCount} ${st.curType==='win'?'victorias':st.curType==='loss'?'derrotas':'—'}`);
+    L.push(`Kelly: ${pct(kellyFraction(arr)*100)}${arr.length<30?' (poco fiable: menos de 30 trades)':''}`);
+    // Disciplina
+    const clean=arr.filter(t=>!isErr(t)), dirty=arr.filter(isErr);
+    const dc=disciplineCost(arr);
+    L.push(`Disciplina: ${pct(disciplineRate(arr))} trades limpios (${clean.length} limpios / ${dirty.length} con flag de error) · Expectancy limpios ${expT(clean)} vs con error ${expT(dirty)}`);
+    L.push(`Coste neto de los errores: ${fmtR(-dc.lostR||0)} (${fmt$(-dc.lost$||0)})${dc.luckyN?` · de ellos, ${dc.luckyN} trade(s) con error salieron bien por suerte (+${num(dc.luckyR)}R, ya descontado)`:''}`);
+    const withPlan=arr.filter(t=>t.planChecked!=null);
+    const full=withPlan.filter(t=>planComplete(t)), partial=withPlan.filter(t=>!planComplete(t));
+    L.push(`Plan completo: ${full.length} trades (exp ${expT(full)}, WR ${wrT(full)}) · Plan incompleto: ${partial.length} trades (exp ${expT(partial)}, WR ${wrT(partial)})`);
+    const sc=arr.map(tradeDiscScore).filter(x=>x!=null);
+    if(sc.length){ const avg=sc.reduce((a,b)=>a+b,0)/sc.length; L.push(`Nota de disciplina media de los trades: ${discStyle(avg).label} (${num(avg)}/4)`); }
+    // Errores por tipo
+    const fs={};
+    arr.forEach(t=>(t.flags||[]).forEach(f=>{ if(f==='clean')return; fs[f]=fs[f]||{n:0,c:0}; fs[f].n++; fs[f].c+=tradeErrorCost(t); }));
+    const fr=Object.entries(fs).sort((a,b)=>b[1].c-a[1].c);
+    if(fr.length) L.push('Errores por tipo (veces · coste en R): '+fr.map(([k,s])=>`${FLAG_LABELS[k]||k} ${s.n}× · ${fmtR(-s.c||0)}`).join(' | '));
+    // R:R óptimo + objetivo final
+    const o=optimalRR(arr);
+    if(o.enough){
+      L.push(`R:R óptimo según MFE: 1:${fmtTP(o.best.tp)} (expectancy simulada ${fmtR(o.best.exp)}, TP alcanzado el ${pct(o.best.wr)}) · Objetivo final medio: ${o.avgDol!=null?num(o.avgDol)+'R ('+o.dolN+' trades)':'sin datos'} · base: ${o.n} trades con MFE`);
+    } else L.push(`R:R óptimo: datos insuficientes (${o.n} trades con MFE, mínimo 5)`);
+    const withDol=arr.filter(t=>(t.dolReached==='yes'||t.dolReached==='no')&&t.result!=='loss');
+    if(withDol.length){
+      const yes=withDol.filter(t=>t.dolReached==='yes');
+      const no=withDol.filter(t=>t.dolReached==='no'&&t.mfe!=null&&!isNaN(t.mfe));
+      L.push(`objetivo final: de ${withDol.length} trades no perdedores, el precio llegó al objetivo final el ${pct(yes.length/withDol.length*100)}${no.length?` · cuando no llega se queda de media en ${num(no.reduce((s,t)=>s+t.mfe,0)/no.length)}R (MFE)`:''}`);
+    }
+    const mfes=arr.filter(t=>t.mfe!=null&&!isNaN(t.mfe)).map(t=>t.mfe);
+    if(mfes.length) L.push(`MFE medio: ${num(mfes.reduce((a,b)=>a+b,0)/mfes.length)}R (${mfes.length} trades)`);
+    // MAE
+    const maeOf=t=>Math.abs(t.mae);
+    const wM=arr.filter(t=>t.result==='win'&&t.mae!=null&&!isNaN(t.mae)), lM=arr.filter(t=>t.result==='loss'&&t.mae!=null&&!isNaN(t.mae));
+    if(wM.length||lM.length) L.push(`MAE: ganadores media ${wM.length?num(wM.reduce((s,t)=>s+maeOf(t),0)/wM.length):'—'}R, máximo ${wM.length?num(Math.max(...wM.map(maeOf))):'—'}R (${wM.length}) · perdedores media ${lM.length?num(lM.reduce((s,t)=>s+maeOf(t),0)/lM.length):'—'}R (${lM.length})`);
+    // BE
+    const be=arr.filter(t=>t.exitType==='be_moved');
+    if(be.length){
+      const tp=be.filter(t=>t.mfe!=null&&!isNaN(t.mfe)&&t.mfe>=(t.plannedR||0));
+      L.push(`Break-even: ${be.length} salidas por BE · ${tp.length} habrían llegado a TP (dejaste ${num(tp.reduce((s,t)=>s+(t.plannedR||0),0))}R / ${fmt$(tp.reduce((s,t)=>s+(t.plannedR||0)*(t.riskUSD||0),0))})`);
+    }
+    // Cierres manuales
+    const man=arr.filter(t=>t.exitType==='manual'&&(t.realizedR||0)>=0&&t.mfe!=null&&!isNaN(t.mfe));
+    if(man.length){
+      const mc=man.filter(t=>!isErr(t)), me=man.filter(isErr);
+      const meTP=me.filter(t=>t.mfe>=(t.plannedR||0));
+      const cost=meTP.reduce((s,t)=>s+Math.max(0,(t.plannedR||0)-(t.realizedR||0)),0);
+      L.push(`Cierres manuales: ${man.length} (${mc.length} limpios, de los que ${mc.filter(t=>t.mfe>=(t.plannedR||0)).length} habrían llegado a TP · ${me.length} con error, de los que ${meTP.length} habrían llegado a TP: coste ${num(cost)}R)`);
+    }
+  };
+
+  // ---------- Desglose por categoría ----------
+  const group=(arr,keyFn,label)=>{
+    const g={};
+    arr.forEach(t=>{ const k=keyFn(t)||'—'; (g[k]=g[k]||[]).push(t); });
+    const rows=Object.entries(g).sort((a,b)=>totalR(b[1])-totalR(a[1]));
+    if(!rows.length) return;
+    L.push(`Por ${label}:`);
+    rows.forEach(([k,ts])=>L.push(`  - ${k}: ${ts.length} trades · exp ${expT(ts)} · WR ${wrT(ts)} · R ${fmtR(totalR(ts))} · P&L ${fmt$(totalPnl(ts))} · con error ${pct(ts.filter(isErr).length/ts.length*100)}`));
+  };
+  const breakdowns=(arr,full)=>{
+    group(arr,t=>{const p=tradePhase(t); return p==='funded'?'Funded':p==='eval'?'Evaluación':'Sin cuenta';},'fase');
+    group(arr,t=>ENTRY_TYPE_LABELS[t.entryType]||(t.entryType?t.entryType:'Sin tipo (trades antiguos)'),'tipo de entrada');
+    group(arr,t=>t.setup,'setup');
+    group(arr,t=>t.session,'sesión');
+    if(full){
+      group(arr,t=>t.symbol,'símbolo');
+      group(arr,t=>dow(t.date),'día de la semana');
+      group(arr,t=>t.moveType?(MOVE_TYPES[t.moveType]||t.moveType):null,'fractal de referencia');
+      group(arr,t=>t.zone?(ZONE_TYPES[t.zone]||t.zone):null,'zona de entrada');
+      group(arr,t=>t.direction?(DIRECTIONS[t.direction]||t.direction):null,'dirección');
+      group(arr,t=>t.targetType?(TARGET_TYPES[t.targetType]||t.targetType):null,'objetivo elegido');
+      group(arr,t=>EXIT_LABELS[t.exitType]||t.exitType,'tipo de salida');
+    }
+    const sm=sessionMfeMae(arr).filter(r=>r.nMfe||r.nMaeW||r.nMaeL);
+    if(sm.length){
+      L.push('MFE / MAE por sesión:');
+      sm.forEach(r=>L.push(`  - ${r.session}: ${r.n} trades · MFE medio ${num(r.mfe)}R (${r.nMfe}) · MAE ganadores ${num(r.maeW)}R (${r.nMaeW}${r.maeWmax!=null?', máx '+num(r.maeWmax)+'R':''}) · MAE perdedores ${num(r.maeL)}R (${r.nMaeL}) · llega al objetivo final ${r.dolPct==null?'—':fmt(r.dolPct,0)+'% ('+r.nDol+')'} · R:R óptimo ${r.opt?'1:'+fmtTP(r.opt.tp)+' ('+fmtR(r.opt.exp)+')':'— (menos de 5 con MFE)'}`));
+    }
+  };
+
+  // ---------- Disciplina diaria (calendario) ----------
+  const calendarBlock=(ym)=>{
+    const byDay={};
+    T.filter(t=>!ym||t.date.startsWith(ym)).forEach(t=>(byDay[t.date]=byDay[t.date]||[]).push(t));
+    const days=Object.values(byDay).map(dayDisciplina).filter(x=>x.score!=null);
+    const nd=NT.filter(n=>(n.type||'noday')==='noday'&&(!ym||n.date.startsWith(ym))&&!byDay[n.date]).map(noTradeDisciplina);
+    const ndM=nd.filter(x=>x.score!=null);
+    const all=[...days,...ndM];
+    if(!all.length&&!nd.length) return;
+    const cnt=f=>all.filter(f).length;
+    const avg=all.length?all.reduce((s,x)=>s+x.score,0)/all.length:null;
+    L.push(`Calendario de disciplina: nota media ${avg==null?'—':discStyle(avg).label+' ('+num(avg)+'/4)'} · días A+/A: ${cnt(x=>x.score>=2.5)} · días B: ${cnt(x=>x.score>=1.5&&x.score<2.5)} · días C: ${cnt(x=>x.score<1.5)} · días sin operar: ${nd.length} (${ndM.filter(x=>x.score>=3.5).length} siguiendo el plan, ${ndM.filter(x=>x.score<1.5).length} sin seguirlo, ${nd.length-ndM.length} sin marcar)`);
+  };
+
+  // =================== CABECERA E INSTRUCCIONES ===================
+  L.push('=== INFORME COMPLETO DEL JOURNAL DE TRADING — ORO (FUTUROS Y CFD) ===');
+  L.push(`Exportado: ${todayISO()} · Periodo: ${T.length?T[0].date+' → '+T[T.length-1].date:'sin trades'} · ${T.length} trades${uniqN(T)!==T.length?` (${uniqN(T)} decisiones únicas: hay trades copiados en varias cuentas)`:''} · ${NT.filter(n=>(n.type||'noday')==='noday').length} días sin operar · ${NT.filter(n=>n.type==='unfilled').length} entradas no ejecutadas`);
+  if(MD.length) L.push(`Además: ${MD.length} día(s) mínimo(s) en fondeadas, aparte (sección 7).`);
+  L.push('Trader: opera oro intradía (XAUUSD en CFD y futuros MGC/GC) en prop firms (evaluaciones y cuentas fondeadas) con un mecanismo de Retroceso e Impulso: zonas extremas y decisionales en fractales Diario/4H/1H, rompimiento en 15m y confirmación de quiebre en 5m y 1m. Prioriza los impulsos (precio ya en zona del macro) frente a los retrocesos. Reglas innegociables: SL máximo 200 pips, riesgo/beneficio mínimo 1:2, si hay duda no se ejecuta. Prioriza asegurar el 1:2 frente a esperar a la zona objetivo.');
+  line();
+  L.push('## 0. CÓMO LEER ESTE INFORME');
+  L.push('- Unidad: R. 1R = el riesgo del trade (distancia de la entrada al stop loss). +2R = ganó el doble de lo arriesgado; -1R = saltó el stop.');
+  L.push('- Resultado: se deduce del R realizado (>0 ganador, <0 perdedor, =0 BE). Los importes en $ son reales del bróker.');
+  L.push('- Win rate: ganadores / (ganadores + perdedores); los BE no cuentan. Expectancy: media de R por trade (los BE cuentan como 0). Profit factor: R ganados / R perdidos.');
+  L.push('- Max drawdown: mayor caída desde un máximo de la curva de R acumulado, en orden cronológico.');
+  L.push('- Kelly = WR - (1-WR)/(avg win/|avg loss|). Es un termómetro de si hay ventaja, no un tamaño de posición.');
+  L.push('- MFE: hasta cuántos R llegó el precio a favor (medido en la ventana del trade, aunque no se cobrara). MAE: cuántos R fue en contra antes de resolverse (siempre positivo).');
+  L.push('- Objetivo final: la siguiente zona decisional/extrema o el alto/bajo anterior del macro. "Objetivo final a XR" = a qué distancia estaba en R. "¿Llegó al objetivo final?" = si el precio lo alcanzó. "Objetivo elegido" = si el trader planeó asegurar el 1:2 o ir a la zona.');
+  L.push('- Flags de error: marcados por el trader en cada trade. "Limpio" = ejecución sin errores.');
+  L.push('- Coste de los errores (por trade): error de entrada (entré sin llegar a la zona, sin confirmación 5m/1m, SL de más de 200 pips, R:B menor de 1:2, entré con dudas, FOMO, revenge) → cuesta su resultado entero (el trade no debía existir); cierre temprano por miedo → TP planificado − R realizado, solo si el MFE llegó al TP; moví el stop → lo perdido más allá de -1R; sobre-dimensioné → 0R; no aseguré el 1:2 y revirtió → 2R − R realizado, solo si el MFE llegó a 2R. Es neto: un error que salió bien resta coste.');
+  L.push('- Checklist del plan: hay 2 tipos de entrada (Impulso y Retroceso) con su checklist (abajo). Las 3 primeras reglas de cada una son innegociables: si falla cualquiera, el setup es C y se marca automáticamente el error correspondiente. Setup automático por reglas falladas: 0 = A+, 1 = A, 2 = B, 3 o más = C (el trader puede cambiarlo a mano). "Plan completo" se mide contra la checklist que había cuando se registró el trade.');
+  L.push('- Nota de disciplina: A+ = 4, A = 3, B = 2, C = 1; un trade con cualquier flag de error cuenta como C. El día hace la media (≥3,5 A+, ≥2,5 A, ≥1,5 B, resto C). Días sin operar: 4 si siguió el plan, 1 si no; sin marcar no cuentan.');
+  L.push('- R:R óptimo: para cada TP de 0,25R a 4R, si el MFE llegó → +TP; si no llegó y tocó el SL (perdedor o MAE ≥ 1) → -1R; si no llegó a ninguno (BE, cierre manual) → 0R. El óptimo es el TP con mayor expectancy simulada.');
+  L.push('- "—" significa sin datos (no cero).');
+  L.push('- Trades simulados (sección 6, identificados como [S1], [S2]...): no operados, resultado hipotético. No mezclarlos con los reales ([T1], [T2]...).');
+  L.push('- Copias (⧉): cuando el trader toma el MISMO trade en varias cuentas, se registra una vez por cuenta y en las estadísticas cuenta como un trade por cuenta (así lo ha decidido el trader). Cada copia indica con qué otros [T#] comparte decisión; las "decisiones únicas" del bloque de estadísticas son los trades sin duplicar. Para analizar el proceso de decisión (win rate real del setup, errores, disciplina) ten en cuenta que una misma decisión pesa tantas veces como cuentas.');
+  L.push('- Días mínimos (sección 7, [D1], [D2]...): en cuentas fondeadas, trades hechos solo para cumplir los días mínimos de la prop (mucho riesgo para un objetivo pequeño, p. ej. arriesgar 600$ para ganar 100$), con sus propias reglas. NO están en las estadísticas de las secciones 1, 2 y 4 (no son el sistema de trading); su dinero SÍ está en el balance de las cuentas (sección 3).');
+  L.push('- Muestras pequeñas (sobre todo en meses sueltos) dan métricas poco fiables; tenlo en cuenta al sacar conclusiones.');
+  line();
+  L.push('Checklists vigentes:');
+  [['impulso',PLAN_IMPULSO],['retroceso',PLAN_RETROCESO]].forEach(([k,list])=>{
+    L.push(`  ${ENTRY_TYPE_LABELS[k]}:`);
+    list.forEach((r,i)=>L.push(`    ${i+1}. ${r}`));
+  });
+  L.push('Flags de error posibles: '+Object.entries(FLAG_LABELS).filter(([k])=>k!=='clean').map(([,l])=>l).join(', '));
+  line();
+
+  // =================== 1. TOTAL ===================
+  L.push('## 1. ESTADÍSTICAS TOTALES (todo el historial)');
+  statsBlock(T);
+  L.push(`Racha actual de días limpios (sin ningún trade con error): ${cleanDayStreak(T)}`);
+  calendarBlock(null);
+  const o=optimalRR(T);
+  if(o.enough) L.push('Curva R:R simulada (TP → expectancy): '+o.curve.map(c=>`1:${fmtTP(c.tp)} ${fmtR(c.exp)}`).join(' | '));
+  line();
+  L.push('Desgloses del total:');
+  breakdowns(T,true);
+  line();
+
+  // =================== 2. POR MES ===================
+  L.push('## 2. ESTADÍSTICAS POR MES');
+  L.push('Comparativa (mes · trades · expectancy · WR · R · P&L · % limpios · coste errores · nota disciplina trades):');
+  months.forEach(ym=>{
+    const arr=T.filter(t=>t.date.startsWith(ym));
+    if(!arr.length){ L.push(`  - ${monthLabel(ym)}: sin trades`); return; }
+    const sc=arr.map(tradeDiscScore).filter(x=>x!=null);
+    const avg=sc.length?sc.reduce((a,b)=>a+b,0)/sc.length:null;
+    L.push(`  - ${monthLabel(ym)}: ${arr.length} · ${expT(arr)} · ${wrT(arr)} · ${fmtR(totalR(arr))} · ${fmt$(totalPnl(arr))} · ${pct(disciplineRate(arr))} · ${fmtR(-disciplineCost(arr).lostR||0)} · ${avg==null?'—':discStyle(avg).label}`);
+  });
+  line();
+  months.forEach(ym=>{
+    const arr=T.filter(t=>t.date.startsWith(ym));
+    L.push(`### ${monthLabel(ym)} (${ym})`);
+    statsBlock(arr);
+    calendarBlock(ym);
+    if(arr.length) breakdowns(arr,false);
+    line();
+  });
+
+  // =================== 3. CUENTAS Y ROI ===================
+  const accts=DB.accounts||[];
+  const costs=DB.propCosts||[], payouts=DB.payouts||[];
+  L.push('## 3. CUENTAS DE PROP FIRMS Y ROI');
+  const spent=costs.reduce((s,c)=>s+(c.amount||0),0), collected=payouts.reduce((s,p)=>s+(p.amount||0),0);
+  L.push(`Gastado: ${fmt$(spent)} (${costs.length} costes) · Cobrado: ${fmt$(collected)} (${payouts.length} payouts) · Neto: ${fmt$(collected-spent)}${spent>0?' · ROI: '+fmt((collected-spent)/spent*100,0)+'%':''}`);
+  const reachedFunded=a=>a.phase==='Funded'||['fondeada','payout'].includes(a.status);
+  const nPassed=accts.filter(a=>a.status==='pasada'||reachedFunded(a)).length;
+  const nDone=accts.filter(a=>(a.status||'en_curso')!=='en_curso'||reachedFunded(a)).length;
+  L.push(`Cuentas: ${accts.length} · en curso ${accts.filter(a=>(a.status||'en_curso')==='en_curso').length} · pasadas ${nPassed} (${nDone?pct(nPassed/nDone*100):'—'} de ${nDone} terminadas) · llegaron a fondeada ${accts.filter(reachedFunded).length} · con payout ${accts.filter(a=>a.status==='payout').length} · perdidas ${accts.filter(a=>a.status==='perdida').length}`);
+  accts.forEach(a=>L.push(`  - ${a.name} · ${[a.firm,a.plan].filter(Boolean).join(' ')} · estado ${STATUS_LABELS[a.status||'en_curso']||a.status}`));
+  L.push('(Desde nov-2026 los trades no se asignan a cuentas: cada trade solo indica si se hizo en evaluación o en fondeada. Un trade tomado en varias cuentas se apunta una vez, con el riesgo y P&L sumados.)');
+  if(costs.length){ L.push('Costes: '+costs.map(c=>`${c.date} ${c.concept||c.firm||''} ${fmt$(c.amount)}`).join(' | ')); }
+  if(payouts.length){ L.push('Payouts: '+payouts.map(p=>`${p.date} ${p.concept||p.firm||''} ${fmt$(p.amount)}`).join(' | ')); }
+  line();
+
+  // =================== 4. TODOS LOS TRADES ===================
+  L.push('## 4. DETALLE DE CADA TRADE (orden cronológico)');
+  const tradeDetail=(t,i,pre)=>{
+    const ph=tradePhase(t);
+    L.push(`[${pre}${i+1}] ${t.date} (${dow(t.date)}) · ${t.symbol||'—'} · cuenta: ${t.account||'sin cuenta'} · fase: ${ph==='funded'?'FUNDED':ph==='eval'?'EVAL':'—'}`);
+    const cs=pre==='T'?copySiblings(t):[];
+    if(cs.length) L.push(`  ⧉ COPIA: es el mismo trade (misma entrada y misma decisión) que ${cs.map(x=>`[T${tIdx.get(x.id)+1}] (cuenta ${x.account||'sin cuenta'})`).join(', ')}. Solo cambian cuenta, riesgo y P&L.`);
+    L.push(`  Tipo de entrada: ${ENTRY_TYPE_LABELS[t.entryType]||'no registrado (trade antiguo)'} · Setup: ${(t.setup||'—').replace('Setup ','')} · Sesión: ${t.session||'—'}${t.moveType?` · Fractal: ${MOVE_TYPES[t.moveType]||t.moveType}`:''}${t.direction?' · '+(DIRECTIONS[t.direction]||t.direction):''}${t.zone?' · '+(ZONE_TYPES[t.zone]||t.zone):''}${t.targetType?' · Objetivo elegido: '+(TARGET_TYPES[t.targetType]||t.targetType):''}${t.stopPips!=null&&!isNaN(t.stopPips)?' · Stop: '+num(t.stopPips,0)+' pips':''}`);
+    if(t.planChecked!=null){
+      const list=planChecklist(t.entryType, tradePhase(t), t.session);
+      const checked=t.planChecked||[];
+      const txt=i=>list[i]!=null?list[i]:`regla ${i+1}`;
+      if(t.planTotal){
+        const failed=[]; for(let k=0;k<t.planTotal;k++) if(!checked.includes(k)) failed.push(k);
+        L.push(`  Plan: ${checked.length}/${t.planTotal} reglas cumplidas${planComplete(t)?' (completo)':''}. Falladas: ${failed.length?failed.map(txt).join(' · '):'ninguna'}`);
+      } else {
+        L.push(`  Plan: ${checked.length} reglas marcadas (checklist antigua: no consta el total; textos según la versión actual)${checked.length?'. Cumplidas: '+checked.map(txt).join(' · '):''}`);
+      }
+    }
+    L.push(`  Riesgo: ${t.riskUSD?fmt$(t.riskUSD):'—'} · R planificado: ${num(t.plannedR)} · R realizado: ${fmtR(t.realizedR||0)} · P&L: ${fmt$(t.pnl||0)} · Resultado: ${t.result==='win'?'GANADOR':t.result==='loss'?'PERDEDOR':'BE'} · Salida: ${EXIT_LABELS[t.exitType]||t.exitType||'—'}`);
+    L.push(`  MFE: ${t.mfe!=null&&!isNaN(t.mfe)?num(t.mfe)+'R':'—'} · MAE: ${t.mae!=null&&!isNaN(t.mae)?num(Math.abs(t.mae))+'R':'—'} · Objetivo final a: ${t.dolR!=null&&!isNaN(t.dolR)?num(t.dolR)+'R':'—'} · ¿Llegó al objetivo final?: ${t.dolReached==='yes'?'sí':t.dolReached==='no'?'no':'—'}`);
+    const errs=(t.flags||[]).filter(f=>f!=='clean');
+    const ds=tradeDiscScore(t);
+    L.push(`  Flags: ${errs.length?errs.map(f=>FLAG_LABELS[f]||f).join(', '):'limpio'}${errs.length?` · coste del error: ${fmtR(-tradeErrorCost(t)||0)}`:''} · nota de disciplina: ${ds==null?'—':discStyle(ds).label}${t.smt==='yes'?` · SMT (dato antiguo): ${t.smtResult}/${t.smtTiming}`:''}${(t.images&&t.images.length)?` · ${t.images.length} captura(s) no incluidas`:''}`);
+    if(t.note) L.push(`  Nota del trader: ${t.note.replace(/\s*\n\s*/g,' ')}`);
+  };
+  T.forEach((t,i)=>tradeDetail(t,i,'T'));
+  line();
+
+  // =================== 5. DÍAS SIN OPERAR ===================
+  if(NT.length){
+    L.push('## 5. DÍAS SIN OPERAR Y ENTRADAS NO EJECUTADAS');
+    NT.forEach(n=>{
+      const noday=(n.type||'noday')==='noday';
+      L.push(`- ${n.date} (${dow(n.date)}) · ${noday?'Día sin operar':'Entrada no ejecutada'}${n.reason?' · motivo: '+(NOTRADE_REASONS[n.reason]||n.reason):''}${noday?' · ¿siguió el plan?: '+(n.planFollowed==='yes'?'sí':n.planFollowed==='no'?'no':'sin marcar'):''}${n.note?' · nota: '+n.note.replace(/\s*\n\s*/g,' '):''}`);
+    });
+    line();
+  }
+  // =================== 6. TRADES SIMULADOS ===================
+  const S=[...(DB.paperTrades||[])].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  if(S.length){
+    L.push('## 6. TRADES SIMULADOS (NO OPERADOS)');
+    L.push('Setups que el trader habría tomado pero NO operó (sobre todo retrocesos, que está validando antes de operarlos en real). Resultado hipotético siguiendo su plan. NO están incluidos en ninguna estadística de las secciones 1-5. Sirven para evaluar si un tipo de entrada o sesión tiene ventaja antes de arriesgar dinero.');
+    const sNY=S.filter(t=>t.entryType==='retroceso'), rNY=T.filter(t=>t.entryType==='retroceso');
+    L.push(`Comparativa retrocesos: simulados ${sNY.length} trades, exp ${sNY.length?fmtR(expectancy(sNY)):'—'} · reales ${rNY.length} trades, exp ${rNY.length?fmtR(expectancy(rNY)):'—'}`);
+    statsBlock(S);
+    breakdowns(S,true);
+    line();
+    L.push('Detalle de cada trade simulado:');
+    S.forEach((t,i)=>tradeDetail(t,i,'S'));
+    line();
+  }
+  if(MD.length){
+    L.push('## 7. DÍAS MÍNIMOS EN CUENTAS FONDEADAS (aparte del trading normal)');
+    const s=minDayStats(MD);
+    L.push(`Reglas de estos trades: ${PLAN_DIA_MINIMO.join(' · ')}`);
+    L.push(`Días mínimos: ${s.n} (${s.w} ganados, ${s.l} perdidos, ${s.be} BE) · acierto ${s.wr==null?'—':pct(s.wr)} · acierto necesario para no perder ${s.beWR==null?'—':pct(s.beWR)} · neto ${fmt$(s.net)} · ganancia media ${s.avgW==null?'—':fmt$(s.avgW)} · pérdida media ${s.avgL==null?'—':fmt$(-s.avgL)} · peor ${s.worst==null?'—':fmt$(s.worst)} · 1 stop equivale a ${s.daysPerStop==null?'—':num(s.daysPerStop,1)} días ganados · reglas completas ${s.full}/${s.withPlan}`);
+    line();
+    L.push('Por sesión:');
+    minDayBySession(MD).forEach(([k,x])=>L.push(`  - ${k}: ${x.n} días (${x.w} ganados / ${x.l} perdidos) · acierto ${x.wr==null?'—':pct(x.wr)} (necesario ${x.beWR==null?'—':pct(x.beWR)}) · neto ${fmt$(x.net)} · peor ${x.worst==null?'—':fmt$(x.worst)}`));
+    line();
+    MD.forEach((t,i)=>tradeDetail(t,i,'D'));
+    line();
+  }
+  L.push('=== FIN DEL INFORME ===');
+  return L.join('\n');
+}
+function exportAIReport(){
+  const report=buildAIReport();
+  const blob=new Blob([report],{type:'text/plain'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');
+  a.href=url; a.download=`crtdesk-informe-${todayISO()}.txt`; a.click();
+  URL.revokeObjectURL(url);
+  toast('Informe para IA exportado');
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+function init(){
+  $('#tabs').addEventListener('click',e=>{
+    const tab=e.target.closest('.tab'); if(!tab)return;
+    $$('.tab').forEach(t=>t.classList.remove('active'));
+    tab.classList.add('active');
+    CURRENT_TAB=tab.dataset.tab; render();
+  });
+  $('#addTradeBtn').onclick=openTradeModal;
+  $('#noTradeBtn').onclick=()=>openNoTradeModal();
+  $('#fab').onclick=openTradeModal;
+  $('#exportBtn').onclick=exportData;
+  $('#aiReportBtn').onclick=exportAIReport;
+  $('#importBtn').onclick=()=>$('#fileInput').click();
+  $('#fileInput').onchange=e=>{ if(e.target.files[0]) importData(e.target.files[0]); e.target.value=''; };
+  if($('#logoutBtn')) $('#logoutBtn').onclick=()=>Cloud.logout();
+  if($('#syncStatus')) $('#syncStatus').onclick=()=>{ toast(Cloud.status.text||'—'); if(Cloud.dirty) Cloud.flush(); };
+  // Cerrar solo si el clic empieza Y termina en el fondo (no al arrastrar desde un input)
+  let _downOnBg=false;
+  $('#modalBg').addEventListener('mousedown',e=>{ _downOnBg = (e.target.id==='modalBg'); });
+  $('#modalBg').addEventListener('mouseup',e=>{ if(_downOnBg && e.target.id==='modalBg') closeModal(); _downOnBg=false; });
+  render();
+}
+Cloud.start({
+  app:'crtdesk',                 // fila del journal de futuros en la nube
+  legacyKey:STORE_KEY,           // journal antiguo del navegador → se migra solo la primera vez
+  normalize:normalizeDB,
+  getDB:()=>DB,
+  setDB:d=>{ DB=d; },
+  onReady:init,
+  onRemoteChange:()=>render(),
+  isBusy:()=>$('#modalBg').classList.contains('show'),
+  toast:m=>toast(m)
+});
