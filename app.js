@@ -199,7 +199,7 @@ const HELP_TEXTS={
   optimalrr:['R:R óptimo','Usa tu MFE para simular qué TP te daría más rentabilidad. Marca tu objetivo final medio (la siguiente zona o el alto/bajo del macro, del campo "Objetivo final en R") para ver si te compensa más asegurar el 1:2 o dejar correr hasta la zona.'],
   manualclose:['Cierres manuales','Analiza tus cierres antes del TP. Respeta tu criterio: si marcaste "limpio", fue buena decisión. Solo cuenta como coste los que marcaste con error.'],
   dolreach:['¿Llega al objetivo final?','De tus trades que no acabaron en stop, cada cuánto el precio llega a tu objetivo final (siguiente zona o alto/bajo del macro). Te dice si aguantar hasta la zona compensa o conviene asegurar el 1:2.'],
-  beanalysis:['Análisis de BE','De tus salidas por BE saltado: cuántos moviste según plan vs por impulso, y cuántos habrían ido a TP (usando el MFE). Te dice si mover el BE pronto te cuesta ganadores.'],
+  beanalysis:['¿Te compensa mover a BE?','Compara lo que ganas y pierdes por mover el stop a break-even. Cuando el BE te saca y el precio luego habría tocado tu stop original, el BE te ha ahorrado una pérdida; cuando habría llegado a tu TP, te ha costado un ganador. El balance neto te dice si te compensa y a partir de qué R conviene moverlo. Necesita que, en cada trade que salte en BE, apuntes qué habría pasado sin moverlo.'],
   sessionmfe:['MFE y MAE por sesión','Compara cómo se mueve el precio en cada sesión: hasta dónde llega a favor (MFE), cuánto aguanta en contra antes de ganar o perder (MAE), cuántas veces llega al objetivo final y qué TP rinde más. Sirve para ajustar TP y SL según la sesión.'],
   maeanalysis:['¿SL demasiado lejos?','Usa el MAE (cuánto fue el precio en contra) de tus ganadores para ver si tu stop está muy holgado. Si tus ganadores sufren poco antes de girarse, podrías ajustar el SL. Te avisa de no comerte los barridos de liquidez.'],
   movetype:['Tu estrategia por partes','Compara tu rendimiento por tipo de entrada (Impulso o Retroceso), fractal de referencia (Diario, 4H o 1H), zona (extrema o decisional), dirección y objetivo elegido (asegurar el 1:2 o ir a la zona). Te dice qué parte de tu mecanismo funciona de verdad.'],
@@ -455,6 +455,55 @@ function disciplineCost(trades){
   });
   // lostR es NETO: lo que tus errores te han costado de verdad (las ganancias por suerte lo compensan).
   return { lostR, lost$, luckyR, luckyN, flaggedCount, cleanCount, total: trades.length };
+}
+
+/* ---------- BREAK-EVEN: ¿compensa mover el stop a BE? ----------
+   Para los trades en los que moviste a BE y saltó, el trader apunta qué habría pasado sin moverlo
+   (noBeOutcome): 'tp' habría llegado al TP, 'sl' habría tocado el stop original, 'none' ninguno.
+   Con eso se reconstruye el R "sin BE" y se compara con el R real. */
+const BE_OUTCOMES={tp:'Habría llegado a mi TP',sl:'Habría tocado mi stop original',none:'Ni TP ni stop: habría cerrado parecido'};
+function beUsed(t){ return t.beMoved==='yes' || t.exitType==='be_moved'; }
+// R que habría sacado sin mover a BE. null = falta el dato.
+function rWithoutBE(t){
+  if(t.exitType!=='be_moved') return t.realizedR||0;      // el BE no le sacó: mismo resultado
+  if(t.noBeOutcome==='tp') return t.plannedR||0;
+  if(t.noBeOutcome==='sl') return -1;
+  if(t.noBeOutcome==='none') return t.realizedR||0;
+  return null;
+}
+function beBucket(t){
+  const x=t.beAt;
+  if(x==null||isNaN(x)) return 'Sin dato';
+  if(x<1) return 'Antes de 1R';
+  if(x<1.5) return 'Entre 1R y 1,5R';
+  return '1,5R o más';
+}
+function beAnalysis(T){
+  const used=T.filter(beUsed);
+  const stopped=used.filter(t=>t.exitType==='be_moved');
+  const known=stopped.filter(t=>rWithoutBE(t)!=null);
+  const missing=stopped.length-known.length;
+  const tp=known.filter(t=>t.noBeOutcome==='tp'), sl=known.filter(t=>t.noBeOutcome==='sl'), none=known.filter(t=>t.noBeOutcome==='none');
+  const lostR=tp.reduce((s,t)=>s+Math.max(0,(t.plannedR||0)-(t.realizedR||0)),0);       // ganadores que te quitó
+  const savedR=sl.reduce((s,t)=>s+Math.max(0,(t.realizedR||0)+1),0);                    // stops que te ahorró
+  const lost$=tp.reduce((s,t)=>s+Math.max(0,(t.plannedR||0)-(t.realizedR||0))*(t.riskUSD||0),0);
+  const saved$=sl.reduce((s,t)=>s+Math.max(0,(t.realizedR||0)+1)*(t.riskUSD||0),0);
+  // Todos los trades con BE y dato completo: R con BE (real) vs R sin BE (reconstruido)
+  const base=used.filter(t=>rWithoutBE(t)!=null);
+  const withBE=totalR(base), withoutBE=base.reduce((s,t)=>s+rWithoutBE(t),0);
+  // Por nivel al que lo moviste
+  const order=['Antes de 1R','Entre 1R y 1,5R','1,5R o más','Sin dato'];
+  const levels=order.map(k=>{
+    const u=used.filter(t=>beBucket(t)===k);
+    const kn=u.filter(t=>t.exitType==='be_moved'&&rWithoutBE(t)!=null);
+    const ktp=kn.filter(t=>t.noBeOutcome==='tp'), ksl=kn.filter(t=>t.noBeOutcome==='sl');
+    const net=ksl.reduce((s,t)=>s+Math.max(0,(t.realizedR||0)+1),0)-ktp.reduce((s,t)=>s+Math.max(0,(t.plannedR||0)-(t.realizedR||0)),0);
+    return {key:k,n:u.length,stopped:u.filter(t=>t.exitType==='be_moved').length,tp:ktp.length,sl:ksl.length,known:kn.length,net};
+  }).filter(r=>r.n);
+  // Por impulso (miedo / fuera de plan) o según plan
+  const impulsive=stopped.filter(t=>(t.flags||[]).some(f=>f==='moved_stop'||f==='early_close'||f==='fomo'));
+  return {used,stopped,known,missing,tp,sl,none,lostR,savedR,lost$,saved$,net:savedR-lostR,net$:saved$-lost$,
+    base,withBE,withoutBE,levels,impulsive};
 }
 
 // Tasa de disciplina (% trades sin errores)
@@ -1012,6 +1061,50 @@ function renderSim(v){
   `;
 }
 
+function beCard(T){
+  const b=beAnalysis(T);
+  if(!b.used.length) return `<p class="hint">Aún no has marcado ningún trade en el que movieras el stop a BE. En el formulario del trade, en <b>"¿Moviste el stop a BE?"</b> pon Sí y a cuántos R lo moviste. Si te sacó en BE, apunta también qué habría pasado sin moverlo: con eso te digo si te compensa.</p>`;
+  const n=b.known.length, few=n<10;
+  const R1=x=>(x>0?'+':'')+fmt(x,1)+'R';
+  let verdict;
+  if(!b.stopped.length) verdict=`<div class="insight">Has movido a BE en ${b.used.length} trade(s) y en ninguno te ha sacado. De momento el BE no te ha costado nada, pero tampoco te ha protegido de nada. Hacen falta trades en los que salte para poder juzgarlo.</div>`;
+  else if(!n) verdict=`<div class="insight warn">Te han sacado en BE ${b.stopped.length} vez/veces, pero no has apuntado qué habría pasado sin moverlo. Abre esos trades (lista de abajo) y rellena <b>"Sin mover a BE, ¿qué habría pasado?"</b>.</div>`;
+  else if(b.net>0) verdict=`<div class="insight ${few?'':''}">Mover a BE <b>te compensa</b>: te ha ahorrado ${fmt(b.savedR,1)}R en stops (${b.sl.length} trade(s) que habrían tocado tu stop) y te ha costado ${fmt(b.lostR,1)}R en ganadores (${b.tp.length} que habrían llegado al TP). Balance: <b class="pos">${R1(b.net)}</b> (${fmt$(b.net$)}).${few?' ⚠ Con menos de 10 casos todavía no es concluyente.':''}</div>`;
+  else if(b.net<0) verdict=`<div class="insight bad">Mover a BE <b>te está costando dinero</b>: te ha quitado ${fmt(b.lostR,1)}R en ganadores (${b.tp.length} trade(s) que habrían llegado al TP) y solo te ha ahorrado ${fmt(b.savedR,1)}R en stops (${b.sl.length}). Balance: <b class="neg">${R1(b.net)}</b> (${fmt$(b.net$)}). Mira la tabla por nivel: si lo mueves demasiado pronto, plantéate moverlo más tarde o no moverlo.${few?' ⚠ Con menos de 10 casos todavía no es concluyente.':''}</div>`;
+  else verdict=`<div class="insight">De momento el BE te ha ahorrado lo mismo que te ha costado (${fmt(b.savedR,1)}R). Sigue registrando.</div>`;
+  const levelRows=b.levels.map(r=>`<tr>
+      <td style="font-family:var(--sans);font-weight:600">${r.key}</td>
+      <td>${r.n}</td><td>${r.stopped}</td><td>${r.tp}</td><td>${r.sl}</td>
+      <td class="${r.known?cls(r.net):''}">${r.known?R1(r.net):'—'}</td></tr>`).join('');
+  const items=b.stopped.map(t=>{
+    const imp=(t.flags||[]).some(f=>f==='moved_stop'||f==='early_close'||f==='fomo');
+    if(t.noBeOutcome==='tp') return {t,tag:`habría ido a TP · -${fmt(Math.max(0,(t.plannedR||0)-(t.realizedR||0)),1)}R${imp?' · por impulso':''}`,tone:'bad',o:0};
+    if(t.noBeOutcome==='sl') return {t,tag:'te salvó del stop · +'+fmt(Math.max(0,(t.realizedR||0)+1),1)+'R',tone:'ok',o:2};
+    if(t.noBeOutcome==='none') return {t,tag:'sin diferencia',tone:'neutral',o:3};
+    return {t,tag:'falta: ¿qué habría pasado?',tone:'warn',o:1};
+  }).sort((a,c)=>a.o-c.o||(a.t.date<c.t.date?1:-1));
+  return `
+    <div class="grid g-4" style="gap:10px">
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">MOVISTE A BE</div><div class="big">${b.used.length}</div><div class="hint" style="margin-top:4px">${fmt(b.used.length/T.length*100,0)}% de tus trades</div></div>
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">TE SACÓ EN BE</div><div class="big">${b.stopped.length}</div><div class="hint" style="margin-top:4px">${b.missing?b.missing+' sin completar':'todos completos'}</div></div>
+      <div class="calc-out" style="border-color:var(--green-dim)"><div class="label" style="font-size:10px;color:var(--green);font-weight:600">TE SALVÓ DEL STOP</div><div class="big pos">${b.sl.length}</div><div class="hint" style="margin-top:4px">+${fmt(b.savedR,1)}R · ${fmt$(b.saved$)}</div></div>
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--red);font-weight:600">TE QUITÓ UN GANADOR</div><div class="big neg">${b.tp.length}</div><div class="hint" style="margin-top:4px">-${fmt(b.lostR,1)}R · ${fmt$(-b.lost$)}</div></div>
+    </div>
+    ${verdict}
+    ${b.base.length?`<div class="grid g-2" style="gap:10px;margin-top:4px">
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">CON BE (LO QUE HICISTE)</div><div class="big ${cls(b.withBE)}">${R1(b.withBE)}</div><div class="hint" style="margin-top:4px">${fmtR(b.withBE/b.base.length)} por trade · ${b.base.length} trades con BE</div></div>
+      <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">SI NUNCA MOVIERAS A BE</div><div class="big ${cls(b.withoutBE)}">${R1(b.withoutBE)}</div><div class="hint" style="margin-top:4px">${fmtR(b.withoutBE/b.base.length)} por trade · mismos trades</div></div>
+    </div>`:''}
+    ${b.levels.length?`<div style="margin-top:14px"><div class="hint" style="font-weight:600;margin-bottom:4px">Según a cuántos R lo moviste</div>
+      <div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th>Lo moviste</th><th>Trades</th><th>Saltó en BE</th><th>Habría ido a TP</th><th>Habría tocado stop</th><th>Balance</th></tr></thead>
+        <tbody>${levelRows}</tbody></table></div>
+      <div class="hint" style="margin-top:6px">Balance positivo = moverlo a ese nivel te compensa. Si el balance es negativo cuando lo mueves pronto y positivo cuando lo mueves más tarde, tu regla debería ser moverlo más tarde.</div></div>`:''}
+    ${b.impulsive.length?`<div class="insight warn" style="margin-top:10px"><b>${b.impulsive.length} de ${b.stopped.length}</b> salidas en BE las marcaste con error (miedo o fuera de plan). Esas no son un problema de la regla de BE, sino de disciplina.</div>`:''}
+    ${tradeDrillList(items,{label:'Ver trades que saltaron en BE'})}
+    <div class="hint" style="margin-top:8px">Cómo se calcula: si te sacó en BE y el precio luego habría llegado a tu TP, cuenta lo que dejaste de ganar (R planificado − R realizado). Si habría tocado tu stop original, cuenta lo que te ahorraste (R realizado + 1R). Los trades en los que moviste a BE y llegaron al TP no cambian.</div>`;
+}
+
 function renderPerformance(v, T){
   v.innerHTML=`
     <div class="section-title">Rendimiento</div>
@@ -1180,53 +1273,8 @@ function renderPerformance(v, T){
       })()}
     </div>
     <div class="card" style="margin-bottom:14px">
-      <h3>Análisis de break-even (BE) ${helpIcon("beanalysis")}</h3>
-      ${(()=>{
-        const be=T.filter(t=>t.exitType==='be_moved');
-        if(!be.length) return `<p class="hint">Aún no tienes salidas marcadas como "Movió BE y saltó". Cuando las registres (con su MFE), te muestro si mueves el BE bien o por impulso, y cuántos habrían ido a TP.</p>`;
-        // bien puesto = sin flags de impulso (siguió el plan: BE solo tras primer objetivo)
-        // mal puesto = con moved_stop o early_close (lo movió por miedo/fuera de plan)
-        const badFlags=t=>(t.flags||[]).some(f=>f==='moved_stop'||f==='early_close'||f==='fomo');
-        const wellPlaced=be.filter(t=>!badFlags(t));
-        const impulsive=be.filter(t=>badFlags(t));
-        // de los BE, cuántos habrían ido a TP (MFE >= plannedR)
-        const withMfe=be.filter(t=>!isNaN(t.mfe)&&t.mfe!=null);
-        const wouldveTP=withMfe.filter(t=>t.mfe>=(t.plannedR||0));
-        const lostR=wouldveTP.reduce((s,t)=>s+(t.plannedR||0),0);
-        const lost$=wouldveTP.reduce((s,t)=>s+(t.plannedR||0)*(t.riskUSD||0),0);
-        // cruce: de los que habrían ido a TP, cuántos por impulso vs por plan
-        const tpByImpulse=wouldveTP.filter(t=>badFlags(t)).length;
-        const tpByPlan=wouldveTP.filter(t=>!badFlags(t)).length;
-        return `
-        <div class="grid g-4" style="gap:10px">
-          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">TOTAL BE</div><div class="big">${be.length}</div></div>
-          <div class="calc-out" style="border-color:var(--green-dim)"><div class="label" style="font-size:10px;color:var(--green);font-weight:600">BIEN PUESTOS</div><div class="big pos">${wellPlaced.length}</div><div class="hint" style="margin-top:4px">según plan</div></div>
-          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">POR IMPULSO</div><div class="big ${impulsive.length?'neg':''}">${impulsive.length}</div><div class="hint" style="margin-top:4px">miedo / fuera de plan</div></div>
-          <div class="calc-out"><div class="label" style="font-size:10px;color:var(--ink-faint)">HABRÍAN IDO A TP</div><div class="big ${wouldveTP.length?'neg':''}">${wouldveTP.length}</div><div class="hint" style="margin-top:4px">${withMfe.length?'de '+withMfe.length+' con MFE':'registra MFE'}</div></div>
-        </div>
-        ${impulsive.length?`<div class="insight warn" style="margin-top:14px"><b>${impulsive.length} de ${be.length} BE los moviste por impulso</b> (miedo o fuera de plan). Revisa si te estás adelantando por miedo.</div>`:`<div class="insight" style="margin-top:14px">Todos tus BE los pusiste siguiendo el plan. 🎯</div>`}
-        ${wouldveTP.length?`<div class="insight bad" style="margin-top:10px"><b>${wouldveTP.length} BE que habrían ido a TP.</b> El precio te sacó en 0R y luego llegó a tu objetivo: dejaste de ganar ${fmt(lostR,1)}R (${fmt$(lost$)}).</div>
-        <div class="insight ${tpByImpulse>tpByPlan?'bad':'warn'}" style="margin-top:10px"><b>El cruce clave:</b> de esos ${wouldveTP.length} ganadores perdidos, <b>${tpByImpulse} fueron por impulso</b> (miedo) y <b>${tpByPlan} por plan</b>. ${tpByImpulse>tpByPlan
-          ? 'La mayoría los perdiste por mover el BE con miedo, no por estrategia. Es un problema de DISCIPLINA: si aguantas tu plan, recuperas esos ganadores.'
-          : tpByPlan>tpByImpulse
-          ? 'La mayoría los perdiste siguiendo tu plan. No es miedo — es tu REGLA de BE la que es demasiado ajustada. Plantéate mover el BE más tarde o a un nivel con más margen.'
-          : 'Están repartidos entre impulso y plan. Ataca las dos cosas: más disciplina para no adelantarte, y revisa si tu nivel de BE es muy ajustado.'}</div>`:withMfe.length?`<div class="insight" style="margin-top:10px">Ninguno de tus BE habría llegado a TP. Moviste bien: el precio no iba a seguir. 👍</div>`:''}
-        ${(()=>{
-          // Lista de los BE: primero los que habrían ido a TP
-          const items=be.map(t=>{
-            const imp=badFlags(t);
-            const hasMfe=t.mfe!=null&&!isNaN(t.mfe);
-            const tp=hasMfe&&t.mfe>=(t.plannedR||0);
-            if(tp&&imp) return {t,tag:`por impulso · habría ido a TP (${fmt(t.plannedR||0,2)}R)`,tone:'bad',o:0};
-            if(tp) return {t,tag:`según plan · habría ido a TP (${fmt(t.plannedR||0,2)}R)`,tone:'bad',o:1};
-            if(imp) return {t,tag:'por impulso',tone:'warn',o:2};
-            if(!hasMfe) return {t,tag:'sin MFE',tone:'neutral',o:4};
-            return {t,tag:'según plan',tone:'ok',o:3};
-          }).sort((a,b)=>a.o-b.o || (a.t.date<b.t.date?1:-1));
-          return tradeDrillList(items);
-        })()}
-        `;
-      })()}
+      <h3>¿Te compensa mover el stop a BE? ${helpIcon("beanalysis")}</h3>
+      ${beCard(T)}
     </div>
     <div class="card" style="margin-bottom:14px">
       <h3>¿Llega el precio a tu objetivo final? ${helpIcon("dolreach")}</h3>
@@ -2346,13 +2394,33 @@ function tradeModal(t){
       <input type="number" id="f_pnl" value="${e.pnl??''}" placeholder="auto">
     </div>
     <div class="field"><label>¿Cómo saliste?</label>
-      <select id="f_exitType">
+      <select id="f_exitType" onchange="toggleBeFields()">
         <option value="target" ${(e.exitType||'target')==='target'?'selected':''}>TP completo (llegué a mi objetivo)</option>
         <option value="manual" ${e.exitType==='manual'?'selected':''}>Cierre manual (cerré antes del objetivo)</option>
-        <option value="be_moved" ${e.exitType==='be_moved'?'selected':''}>Movió BE y saltó (salí en ~0R)</option>
+        <option value="be_moved" ${e.exitType==='be_moved'?'selected':''}>Moví a BE y saltó (salí en ~0R)</option>
         <option value="stop" ${e.exitType==='stop'?'selected':''}>SL (saltó el stop)</option>
       </select>
       <div class="hint" style="margin-top:5px">Lo que de verdad cuenta para tus métricas es el <b>R realizado</b> de arriba. Esto solo clasifica cómo cerraste.</div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>¿Moviste el stop a BE?</label>
+        <select id="f_beMoved" onchange="toggleBeFields()">
+          ${(()=>{ const bm=e.beMoved||(e.exitType==='be_moved'?'yes':''); return `
+          <option value="" ${!bm?'selected':''}>— no registrado —</option>
+          <option value="yes" ${bm==='yes'?'selected':''}>Sí</option>
+          <option value="no" ${bm==='no'?'selected':''}>No</option>`; })()}
+        </select>
+      </div>
+      <div class="field" id="f_beAtWrap"><label>¿Al llegar a cuántos R? <span class="hint">cuando lo moviste</span></label>
+        <input type="number" id="f_beAt" step="0.1" min="0" value="${e.beAt??''}" placeholder="ej. 1">
+      </div>
+    </div>
+    <div class="field" id="f_noBeWrap"><label>Sin mover a BE, ¿qué habría pasado? <span class="hint">el dato clave</span></label>
+      <select id="f_noBeOutcome">
+        <option value="" ${!e.noBeOutcome?'selected':''}>— no registrado —</option>
+        ${Object.entries(BE_OUTCOMES).map(([k,l])=>`<option value="${k}" ${e.noBeOutcome===k?'selected':''}>${l}</option>`).join('')}
+      </select>
+      <div class="hint" style="margin-top:5px">Mira el gráfico después de que te sacara: ¿el precio tocó antes tu TP o tu stop original? Con esto el journal te dice si mover a BE te compensa.</div>
     </div>
     <div class="field-row">
       <div class="field" id="f_dolWrap"><label>¿Llegó al objetivo final?</label>
@@ -2416,6 +2484,16 @@ function tradeModal(t){
   onRealizedRChange();
   toggleMoveOther();
   checkHardRules();
+  toggleBeFields();
+}
+// Muestra los campos de BE según lo que se haya elegido
+function toggleBeFields(){
+  const ex=$('#f_exitType')?.value, bm=$('#f_beMoved');
+  if(!bm) return;
+  if(ex==='be_moved') bm.value='yes';             // si saltó en BE, es que lo moviste
+  const a=$('#f_beAtWrap'), o=$('#f_noBeWrap');
+  if(a) a.style.display = bm.value==='yes' ? '' : 'none';
+  if(o) o.style.display = ex==='be_moved' ? '' : 'none';
 }
 // Avisa en el formulario si el trade incumple las reglas de riesgo innegociables
 function checkHardRules(){
@@ -2683,6 +2761,9 @@ function saveTrade(id){
     pnl:parseFloat($('#f_pnl').value)|| ((isNaN(realizedR)?0:realizedR)*(parseFloat($('#f_riskUSD').value)||0)),
     result:resultFromR(realizedR)||'be',
     exitType:$('#f_exitType').value,
+    beMoved:$('#f_exitType').value==='be_moved'?'yes':($('#f_beMoved')?.value||''),
+    beAt:($('#f_exitType').value==='be_moved'||$('#f_beMoved')?.value==='yes')?parseFloat($('#f_beAt')?.value):NaN,
+    noBeOutcome:$('#f_exitType').value==='be_moved'?($('#f_noBeOutcome')?.value||''):'',
     result11:existing?.result11||'',
     dolReached:$('#f_dolReached').value,
     dolR:parseFloat($('#f_dolR').value),
@@ -3170,7 +3251,12 @@ function buildAIReport(){
     const wM=arr.filter(t=>t.result==='win'&&t.mae!=null&&!isNaN(t.mae)), lM=arr.filter(t=>t.result==='loss'&&t.mae!=null&&!isNaN(t.mae));
     if(wM.length||lM.length) L.push(`MAE: ganadores media ${wM.length?num(wM.reduce((s,t)=>s+maeOf(t),0)/wM.length):'—'}R, máximo ${wM.length?num(Math.max(...wM.map(maeOf))):'—'}R (${wM.length}) · perdedores media ${lM.length?num(lM.reduce((s,t)=>s+maeOf(t),0)/lM.length):'—'}R (${lM.length})`);
     // BE
-    const be=arr.filter(t=>t.exitType==='be_moved');
+    const bA=beAnalysis(arr);
+    if(bA.used.length){
+      L.push(`Break-even: movió el stop a BE en ${bA.used.length} trades · le sacó en BE ${bA.stopped.length} · de ellos, sin BE ${bA.tp.length} habrían llegado al TP (-${num(bA.lostR,1)}R) y ${bA.sl.length} habrían tocado el stop original (+${num(bA.savedR,1)}R ahorrados), ${bA.none.length} sin diferencia, ${bA.missing} sin dato · balance neto del BE: ${fmtR(bA.net)} (${fmt$(bA.net$)})${bA.base.length?` · R total con BE ${fmtR(bA.withBE)} vs sin BE ${fmtR(bA.withoutBE)} en ${bA.base.length} trades`:''}`);
+      if(bA.levels.length) L.push('  BE por nivel al que se movió: '+bA.levels.map(r=>`${r.key}: ${r.n} trades, ${r.stopped} saltaron, ${r.tp} habrían ido a TP, ${r.sl} a stop, balance ${r.known?fmtR(r.net):'—'}`).join(' | '));
+    }
+    const be=[];
     if(be.length){
       const tp=be.filter(t=>t.mfe!=null&&!isNaN(t.mfe)&&t.mfe>=(t.plannedR||0));
       L.push(`Break-even: ${be.length} salidas por BE · ${tp.length} habrían llegado a TP (dejaste ${num(tp.reduce((s,t)=>s+(t.plannedR||0),0))}R / ${fmt$(tp.reduce((s,t)=>s+(t.plannedR||0)*(t.riskUSD||0),0))})`);
@@ -3252,6 +3338,7 @@ function buildAIReport(){
   L.push('- Trades simulados (sección 6, identificados como [S1], [S2]...): no operados, resultado hipotético. No mezclarlos con los reales ([T1], [T2]...).');
   L.push('- Copias (⧉): cuando el trader toma el MISMO trade en varias cuentas, se registra una vez por cuenta y en las estadísticas cuenta como un trade por cuenta (así lo ha decidido el trader). Cada copia indica con qué otros [T#] comparte decisión; las "decisiones únicas" del bloque de estadísticas son los trades sin duplicar. Para analizar el proceso de decisión (win rate real del setup, errores, disciplina) ten en cuenta que una misma decisión pesa tantas veces como cuentas.');
   L.push('- Días mínimos (sección 7, [D1], [D2]...): en cuentas fondeadas, trades hechos solo para cumplir los días mínimos de la prop (mucho riesgo para un objetivo pequeño, p. ej. arriesgar 600$ para ganar 100$), con sus propias reglas. NO están en las estadísticas de las secciones 1, 2 y 4 (no son el sistema de trading); su dinero SÍ está en el balance de las cuentas (sección 3).');
+  L.push('- Break-even: en cada trade se indica si movió el stop a BE y a cuántos R. Si le sacó en BE, apunta qué habría pasado sin moverlo (habría llegado al TP / habría tocado el stop original / ninguno). Balance del BE = R ahorrados en los que habrían tocado el stop (R realizado + 1) − R perdidos en los que habrían llegado al TP (R planificado − R realizado).');
   L.push('- Muestras pequeñas (sobre todo en meses sueltos) dan métricas poco fiables; tenlo en cuenta al sacar conclusiones.');
   line();
   L.push('Checklists vigentes:');
@@ -3330,7 +3417,7 @@ function buildAIReport(){
       }
     }
     L.push(`  Riesgo: ${t.riskUSD?fmt$(t.riskUSD):'—'} · R planificado: ${num(t.plannedR)} · R realizado: ${fmtR(t.realizedR||0)} · P&L: ${fmt$(t.pnl||0)} · Resultado: ${t.result==='win'?'GANADOR':t.result==='loss'?'PERDEDOR':'BE'} · Salida: ${EXIT_LABELS[t.exitType]||t.exitType||'—'}`);
-    L.push(`  MFE: ${t.mfe!=null&&!isNaN(t.mfe)?num(t.mfe)+'R':'—'} · MAE: ${t.mae!=null&&!isNaN(t.mae)?num(Math.abs(t.mae))+'R':'—'} · Objetivo final a: ${t.dolR!=null&&!isNaN(t.dolR)?num(t.dolR)+'R':'—'} · ¿Llegó al objetivo final?: ${t.dolReached==='yes'?'sí':t.dolReached==='no'?'no':'—'}`);
+    L.push(`  MFE: ${t.mfe!=null&&!isNaN(t.mfe)?num(t.mfe)+'R':'—'} · MAE: ${t.mae!=null&&!isNaN(t.mae)?num(Math.abs(t.mae))+'R':'—'} · Objetivo final a: ${t.dolR!=null&&!isNaN(t.dolR)?num(t.dolR)+'R':'—'} · ¿Llegó al objetivo final?: ${t.dolReached==='yes'?'sí':t.dolReached==='no'?'no':'—'}${beUsed(t)?` · BE: sí${t.beAt!=null&&!isNaN(t.beAt)?' a '+num(t.beAt,1)+'R':''}${t.exitType==='be_moved'?', le sacó; sin BE: '+(BE_OUTCOMES[t.noBeOutcome]||'sin dato'):''}`:t.beMoved==='no'?' · BE: no':''}`);
     const errs=(t.flags||[]).filter(f=>f!=='clean');
     const ds=tradeDiscScore(t);
     L.push(`  Flags: ${errs.length?errs.map(f=>FLAG_LABELS[f]||f).join(', '):'limpio'}${errs.length?` · coste del error: ${fmtR(-tradeErrorCost(t)||0)}`:''} · nota de disciplina: ${ds==null?'—':discStyle(ds).label}${t.smt==='yes'?` · SMT (dato antiguo): ${t.smtResult}/${t.smtTiming}`:''}${(t.images&&t.images.length)?` · ${t.images.length} captura(s) no incluidas`:''}`);
