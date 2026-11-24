@@ -85,6 +85,7 @@ const DEFAULTS = {
   propCosts: [],     // {id, date, amount, concept, firm}
   payouts: [],       // {id, date, amount, concept, firm}
   paperTrades: [],   // trades SIMULADOS (no operados): mismo formato que trades, sin cuenta ni dinero
+  missedTrades: [],  // operaciones NO TOMADAS: setups que se dieron y no disparé (motivo + resultado que habrían tenido)
   firms: null,   // se inicializa desde FIRM_PRESETS la primera vez (así el usuario puede editarlas)
   settings: { riskPerTradePct: 25 },
   meta: { created: Date.now() }
@@ -208,6 +209,8 @@ const HELP_TEXTS={
   streaks:['Rachas','Tu racha actual y tus récords de victorias y derrotas seguidas. Ayuda con la psicología: saber tu peor racha histórica te calma cuando encadenas pérdidas.'],
   daydisc:['Día + disciplina','Tu rendimiento y % de errores por día de la semana. Te dice si un mal día es por el mercado o porque tú operas peor ese día.'],
   bymonth:['Rendimiento por mes','Tu expectancy, winrate, R acumulado y % de errores mes a mes. Sirve para ver tu evolución en el tiempo y si vas mejorando.'],
+  missedtab:['Operaciones no tomadas','Setups que se dieron y no disparaste, con el motivo y el resultado que habrían tenido siguiendo tu plan. No cuentan en tus estadísticas reales. Sirven para ver qué te frena (análisis, psicología o gestión del riesgo) y cuánto R se queda fuera por cada motivo.'],
+  missedtime:['Evolución','Cuántas operaciones dejas pasar cada semana, separadas por grupo de motivo. Lo ideal es que las psicológicas vayan bajando con el tiempo.'],
   // Sizing
   kelly:['Kelly','Termómetro de tu edge, no tu sizing. Valida si tienes ventaja real. Necesita 30+ trades para ser fiable.'],
   roiglobal:['ROI global','Tu negocio de props: total gastado en cuentas vs total cobrado en payouts. El ROI % te dice cuánto recuperas por cada $ invertido.'],
@@ -598,7 +601,7 @@ function render(){
     ? `<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start">${phaseFilterBar()}${showMonth?monthFilterBar():''}</div>`
     : '';
   const hasNoTrade=(DB.noTradeDays||[]).length>0;
-  if(CURRENT_TAB!=='roi' && CURRENT_TAB!=='sim' && !T.length && !(CURRENT_TAB==='calendar'&&hasNoTrade)){
+  if(CURRENT_TAB!=='roi' && CURRENT_TAB!=='sim' && CURRENT_TAB!=='missed' && !T.length && !(CURRENT_TAB==='calendar'&&hasNoTrade)){
     // Hay trades pero ninguno con este filtro (mes / Eval-Funded): no mostrar "aún no hay trades"
     v.innerHTML = filterBars() + (DB.trades.length && showFilter
       ? `<div class="empty"><div class="ico">◴</div><p class="hint">No hay trades con este filtro. Cambia el mes o Eval/Funded.</p></div>`
@@ -612,7 +615,8 @@ function render(){
     roi:renderROI,
     calendar:renderCalendar,
     journal:renderJournal,
-    sim:renderSim
+    sim:renderSim,
+    missed:renderMissed
   })[CURRENT_TAB](v, T);
   if(CURRENT_TAB==='performance' && MD.length) v.insertAdjacentHTML('beforeend', minDayCard(MD));
   // prepend filter bar en pestañas de métricas
@@ -887,7 +891,7 @@ function tradeDrillList(items, opts={}){
         return `<div onclick="${fn}('${t.id}')" title="Abrir el trade" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 11px;border:1px solid ${hot?'rgba(255,90,90,.45)':'var(--line)'};border-radius:9px;background:${hot?'rgba(255,90,90,.06)':'transparent'}">
           <div style="min-width:0">
             <div style="font-weight:600;font-size:13px">${d(t)} · ${t.symbol||'—'} <span class="hint">${t.session||''}${t.setup?' · '+t.setup.replace('Setup ',''):''}</span></div>
-            <div class="hint" style="margin-top:2px">Realizado ${fmtR(t.realizedR||0)} · TP ${R(t.plannedR)} · MFE ${R(t.mfe)}${errs.length?' · '+errs.join(', '):' · limpio'}</div>
+            <div class="hint" style="margin-top:2px">${t.missed?'Habría sacado':'Realizado'} ${fmtR(t.realizedR||0)} · TP ${R(t.plannedR)} · MFE ${R(t.mfe)}${t.missed?(t.seenLive==='review'?' · vista revisando':' · vista en directo'):errs.length?' · '+errs.join(', '):' · limpio'}</div>
           </div>
           <span class="tag ${tone}" style="white-space:nowrap;flex-shrink:0">${tag} ›</span>
         </div>`;
@@ -2094,7 +2098,7 @@ function modalCopies(){
 // aparece también la regla de fondeadas (solo cuenta para esas cuentas).
 function checklistPhase(){
   const p=modalPhase();
-  if(TRADE_MODE==='sim'||p==='funded') return p;
+  if(TRADE_MODE==='sim'||TRADE_MODE==='missed'||p==='funded') return p;
   const sibs=($('#modalBg')?._copySibIds||[]).map(id=>DB.trades.find(x=>x.id===id)).filter(Boolean);
   const anyFunded=sibs.some(s=>tradePhase(s)==='funded')||modalCopies().some(c=>c.acc.phase==='Funded');
   return anyFunded?'funded':p;
@@ -2174,11 +2178,163 @@ function strategyBreakdowns(T){
 }
 
 
-// Modo del formulario de trade: 'real' (DB.trades) o 'sim' (DB.paperTrades, trades simulados no operados)
+/* ---------- OPERACIONES NO TOMADAS ----------
+   Setups que se dieron y no disparé. Se guardan en DB.missedTrades y NUNCA cuentan en las estadísticas reales. */
+const MISSED_GROUPS={
+  analisis:{label:'Análisis',color:'#4d9fff'},
+  psico:{label:'Psicológicos',color:'#ffb84d'},
+  riesgo:{label:'Gestión del riesgo',color:'#a78bfa'},
+  otro:{label:'Otros',color:'#8a97a8'}
+};
+const MISSED_REASONS={
+  zone_unclear:{g:'analisis',l:'No tenía clara la zona'},
+  confirm_late:{g:'analisis',l:'No vi a tiempo el quiebre de 5m/1m'},
+  bad_read:{g:'analisis',l:'Leí mal el fractal o la estructura'},
+  fear:{g:'psico',l:'Miedo a perder'},
+  hesitation:{g:'psico',l:'Dudé al disparar'},
+  after_loss:{g:'psico',l:'Venía de un stop y no me atreví'},
+  waited:{g:'psico',l:'Esperé más confirmación y se fue'},
+  protect_day:{g:'psico',l:'Iba en positivo y no quise arriesgar'},
+  sl_big:{g:'riesgo',l:'El stop pasaba de 200 pips'},
+  rr_low:{g:'riesgo',l:'No llegaba a 1:2'},
+  day_limit:{g:'riesgo',l:'Ya había llegado a mi límite del día'},
+  other:{g:'otro',l:'Otro (lo explico en la nota)'}
+};
+const SEEN_LABELS={live:'La vi en directo',review:'La vi después, revisando'};
+const missedGroupOf=k=>(MISSED_REASONS[k]||{}).g||'otro';
+// Grupo principal de una operación no tomada (el del primer motivo)
+const missedMainGroup=t=>missedGroupOf((t.missedReasons||[])[0]);
+// Lunes de la semana de una fecha AAAA-MM-DD
+function weekStart(d){ const [y,m,dd]=d.split('-').map(Number); const x=new Date(y,m-1,dd); x.setDate(x.getDate()-((x.getDay()+6)%7));
+  return `${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`; }
+function toggleMissedReason(k){
+  const a=$('#modalBg')._missedReasons; const i=a.indexOf(k);
+  if(i>=0) a.splice(i,1); else a.push(k);
+  $$('#f_missedReasons .chip').forEach(c=>{ c.className='chip'+(a.includes(c.dataset.reason)?' on':''); });
+}
+function setSeen(v){
+  $('#modalBg')._seen=v;
+  $$('#f_seen .chip').forEach(c=>{ c.className='chip'+(c.dataset.seen===v?' on good':''); });
+}
+
+let MISSED_VIEW='all'; // 'all' | 'live' | 'review'
+function setMissedView(v){ MISSED_VIEW=v; render(); }
+function missedStats(arr){
+  const W=arr.filter(t=>t.result==='win'), Lo=arr.filter(t=>t.result==='loss');
+  return { n:arr.length, w:W.length, l:Lo.length, be:arr.length-W.length-Lo.length,
+    wr:(W.length+Lo.length)?W.length/(W.length+Lo.length)*100:null, r:totalR(arr), exp:arr.length?expectancy(arr):null };
+}
+function renderMissed(v){
+  const ALL=[...(DB.missedTrades||[])].sort((a,b)=> a.date<b.date?1:-1);
+  const M=ALL.filter(t=>MISSED_VIEW==='all'||(t.seenLive||'live')===MISSED_VIEW);
+  const REAL=(DB.trades||[]).filter(t=>!isMinDay(t));
+  const R1=x=>x==null?'—':(x>0?'+':'')+fmt(x,1)+'R';
+  const nLive=ALL.filter(t=>(t.seenLive||'live')==='live').length, nRev=ALL.length-nLive;
+  const head=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <div class="section-title" style="margin:0">Operaciones no tomadas ${helpIcon("missedtab")}</div>
+      <button class="btn primary sm" onclick="openMissedModal()">+ No tomada</button>
+    </div>`;
+  if(!ALL.length){
+    v.innerHTML=head+`<div class="empty"><div class="ico">👀</div>
+      <p style="font-size:15px;color:var(--ink-dim);margin-bottom:6px">Aún no has apuntado ninguna operación no tomada</p>
+      <p class="hint" style="max-width:420px;margin:0 auto 18px">Cuando se dé un setup y no dispares (no tenías clara la zona, dudaste, venías de un stop, el stop era demasiado grande…), apúntalo aquí con el motivo y el resultado que habría tenido. No cuenta en tus estadísticas reales; sirve para ver qué te frena.</p>
+      <button class="btn primary" onclick="openMissedModal()">+ Apuntar la primera</button></div>`;
+    return;
+  }
+  const s=missedStats(M), sr=missedStats(REAL);
+  // ---- por grupo y por motivo (un trade puede tener varios motivos: cuenta en cada uno) ----
+  const byGroup=Object.keys(MISSED_GROUPS).map(g=>{ const a=M.filter(t=>(t.missedReasons||[]).some(k=>missedGroupOf(k)===g)); return {g,...missedStats(a)}; }).filter(x=>x.n);
+  const byReason=Object.keys(MISSED_REASONS).map(k=>{ const a=M.filter(t=>(t.missedReasons||[]).includes(k)); return {k,...missedStats(a)}; }).filter(x=>x.n).sort((a,b)=>b.n-a.n);
+  const maxN=Math.max(1,...byReason.map(x=>x.n));
+  // ---- avisos ----
+  const ins=[];
+  const today=todayISO(), wk=weekStart(today);
+  const thisWeek=ALL.filter(t=>weekStart(t.date)===wk);
+  const cnt={}; thisWeek.forEach(t=>(t.missedReasons||[]).forEach(k=>cnt[k]=(cnt[k]||0)+1));
+  Object.entries(cnt).filter(([,n])=>n>=3).sort((a,b)=>b[1]-a[1]).forEach(([k,n])=>{
+    const g=missedGroupOf(k);
+    ins.push({c:g==='psico'?'bad':'warn',t:`Esta semana, <b>"${MISSED_REASONS[k].l}"</b> te ha hecho dejar pasar <b>${n} operaciones</b>.${g==='psico'?' Es un patrón psicológico: llévalo a tu checklist de antes de la sesión.':g==='analisis'?' Repasa cómo marcas las zonas antes de abrir.':''}`});
+  });
+  if(!ins.length && thisWeek.length>=3) ins.push({c:'warn',t:`Esta semana llevas <b>${thisWeek.length} operaciones no tomadas</b>.`});
+  const topR=[...byGroup].filter(x=>x.n>=3).sort((a,b)=>b.r-a.r)[0];
+  if(topR && topR.r>0) ins.push({c:'',t:`Las que dejas pasar por motivos <b>${MISSED_GROUPS[topR.g].label.toLowerCase()}</b> son las que más R habrían dado: <b>${R1(topR.r)}</b> en ${topR.n} operaciones.`});
+  const risk=byGroup.find(x=>x.g==='riesgo');
+  if(risk && risk.n>=3) ins.push({c:'',t:risk.r<0?`Las que descartaste por <b>gestión del riesgo</b> habrían dado <b>${R1(risk.r)}</b>: tus reglas te están protegiendo.`:`Las que descartaste por <b>gestión del riesgo</b> habrían dado <b>${R1(risk.r)}</b> en ${risk.n} operaciones. Con más datos sabrás si alguna regla es demasiado estricta.`});
+  if(nRev>=5 && nRev>nLive) ins.push({c:'warn',t:`Más de la mitad (<b>${nRev} de ${ALL.length}</b>) las viste después, revisando el gráfico. A posteriori todo parece claro: fíjate sobre todo en las que viste en directo.`});
+  // ---- semanas (últimas 12) ----
+  const weeks=[]; { const [y,m,d]=wk.split('-').map(Number); for(let i=11;i>=0;i--){ const x=new Date(y,m-1,d-7*i); weeks.push(`${x.getFullYear()}-${String(x.getMonth()+1).padStart(2,'0')}-${String(x.getDate()).padStart(2,'0')}`); } }
+  v.innerHTML=head+`
+    <div class="phase-filter" style="margin-bottom:14px">
+      ${[['all','Todas',ALL.length],['live','En directo',nLive],['review','Revisando después',nRev]].map(([k,l,n])=>`<button class="phase-btn ${MISSED_VIEW===k?'active':''}" onclick="setMissedView('${k}')">${l} <span class="pf-count">${n}</span></button>`).join('')}
+    </div>
+    ${!M.length?`<div class="empty"><p class="hint">No hay operaciones con este filtro.</p></div>`:`
+    <div class="grid g-4" style="margin-bottom:14px">
+      ${statCard('No tomadas', s.n, `${M.filter(t=>(t.seenLive||'live')==='live').length} en directo · ${M.filter(t=>t.seenLive==='review').length} revisando`)}
+      ${statCard('Habrían ganado', s.w, `${s.l} perdido · ${s.be} BE${s.wr!=null?' · acierto '+fmt(s.wr,0)+'%':''}`)}
+      ${statCard('Resultado que habrían dado', R1(s.r), 'sumando todas', cls(s.r))}
+      ${statCard('Por operación', s.exp==null?'—':fmtR(s.exp), sr.n?`tus reales: ${fmtR(sr.exp)}`:'aún sin trades reales', s.exp==null?'':cls(s.exp))}
+    </div>
+    ${ins.length?`<div style="margin-bottom:14px">${ins.map(i=>`<div class="insight ${i.c}">${i.t}</div>`).join('')}</div>`:''}
+    <div class="grid g-2" style="margin-bottom:14px">
+      <div class="card">
+        <h3>Por grupo de motivo</h3>
+        <div style="display:flex;flex-direction:column;gap:12px">
+        ${byGroup.map(x=>`<div>
+          <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+            <span style="font-weight:600"><span class="dot" style="background:${MISSED_GROUPS[x.g].color};margin-right:6px"></span>${MISSED_GROUPS[x.g].label}</span>
+            <span style="font-family:var(--mono);font-size:13px">${x.n} · <span class="${cls(x.r)}">${R1(x.r)}</span></span>
+          </div>
+          <div class="bar-track"><div class="bar-fill" style="width:${x.n/s.n*100}%;background:${MISSED_GROUPS[x.g].color}"></div></div>
+          <div class="hint" style="margin-top:4px">${x.w} habrían ganado · ${x.l} perdido${x.wr!=null?' · acierto '+fmt(x.wr,0)+'%':''} · ${x.exp==null?'—':fmtR(x.exp)} por operación</div>
+        </div>`).join('')}
+        </div>
+        <div class="hint" style="margin-top:10px">Una operación con varios motivos cuenta en cada uno de sus grupos.</div>
+      </div>
+      <div class="card">
+        <h3>Evolución por semana ${helpIcon("missedtime")}</h3>
+        <div style="position:relative;height:220px"><canvas id="missedChart"></canvas></div>
+        <div class="legend">${Object.entries(MISSED_GROUPS).map(([,g])=>`<span><span class="dot" style="background:${g.color}"></span>${g.label}</span>`).join('')}</div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Por motivo</h3>
+      <div class="table-wrap" style="border:none"><table style="min-width:auto">
+        <thead><tr><th>Motivo</th><th>Veces</th><th></th><th>Habrían ganado</th><th>Resultado</th><th>Por operación</th></tr></thead>
+        <tbody>${byReason.map(x=>`<tr>
+          <td style="font-family:var(--sans);font-weight:600"><span class="dot" style="background:${MISSED_GROUPS[missedGroupOf(x.k)].color};margin-right:6px"></span>${MISSED_REASONS[x.k].l}</td>
+          <td>${x.n}</td>
+          <td style="width:22%"><div class="bar-track" style="margin:0"><div class="bar-fill" style="width:${x.n/maxN*100}%;background:${MISSED_GROUPS[missedGroupOf(x.k)].color}"></div></div></td>
+          <td>${x.w} de ${x.n}</td>
+          <td class="${cls(x.r)}">${R1(x.r)}</td>
+          <td class="${x.exp==null?'':cls(x.exp)}">${x.exp==null?'—':fmtR(x.exp)}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Lista de operaciones no tomadas</h3>
+      ${tradeDrillList(M.map(t=>({t,tag:`${(t.missedReasons||[]).map(k=>(MISSED_REASONS[k]||{}).l||k).join(' · ')||'sin motivo'} · ${R1(t.realizedR||0)}`,tone:'neutral'})),{open:true,fn:'editMissed',label:'Operaciones'})}
+    </div>`}
+  `;
+  // ---- gráfico semanal apilado por grupo ----
+  const el=$('#missedChart');
+  if(el && typeof Chart!=='undefined'){
+    const base=chartBase();
+    base.scales.x.stacked=true; base.scales.y.stacked=true; base.scales.y.ticks.precision=0; base.scales.y.ticks.stepSize=1;
+    const labels=weeks.map(w=>{ const [,m,d]=w.split('-'); return `${+d}/${+m}`; });
+    charts.missed=new Chart(el,{type:'bar',data:{labels,datasets:Object.entries(MISSED_GROUPS).map(([g,o])=>({
+      label:o.label, backgroundColor:o.color, borderRadius:3,
+      data:weeks.map(w=>M.filter(t=>weekStart(t.date)===w&&missedMainGroup(t)===g).length)
+    }))},options:base});
+  }
+}
+
+// Modo del formulario de trade: 'real' (DB.trades), 'sim' (DB.paperTrades) o 'missed' (DB.missedTrades)
 let TRADE_MODE='real';
 function openTradeModal(){ TRADE_MODE='real'; tradeModal(); }
 function openSimModal(){ TRADE_MODE='sim'; tradeModal(); }
 function editSim(id){ TRADE_MODE='sim'; tradeModal((DB.paperTrades||[]).find(t=>t.id===id)); }
+function openMissedModal(){ TRADE_MODE='missed'; tradeModal(); }
+function editMissed(id){ TRADE_MODE='missed'; tradeModal((DB.missedTrades||[]).find(t=>t.id===id)); }
 
 /* ---------- Dia sense trade ---------- */
 function openNoTradeModal(existing){
@@ -2308,7 +2464,8 @@ function editTrade(id){ TRADE_MODE='real'; tradeModal(DB.trades.find(t=>t.id===i
 function tradeModal(t){
   const e=t||{};
   const flags=e.flags||['clean'];
-  const SIM=TRADE_MODE==='sim';
+  const MISSED=TRADE_MODE==='missed';
+  const SIM=TRADE_MODE==='sim'||MISSED;   // las no tomadas se rellenan como un simulado (sin cuenta ni dinero)
   const sibs=SIM?[]:copySiblings(e);
   // Si alguna copia es fondeada y esta no, recupera la regla extra de fondeadas de esa copia
   let planChecked=[...(e.planChecked||[])];
@@ -2332,8 +2489,17 @@ function tradeModal(t){
       </div>`).join('')}</div>`:`<div class="hint">No hay más cuentas activas${sibs.length?' para añadir':''}.</div>`}
     </div>`;
   $('#modalBg').innerHTML=`<div class="modal">
-    <h2>${SIM?(t?'Editar trade simulado':'Nuevo trade simulado'):(t?'Editar trade':'Nuevo trade')} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
-    ${SIM?`<div class="insight warn" style="margin-bottom:14px">🧪 <b>Trade simulado</b>: el setup que habrías tomado pero no operaste. Apunta el resultado que habría tenido siguiendo tu plan. No cuenta en tus estadísticas reales, cuentas ni calendario.</div>`:''}
+    <h2>${MISSED?(t?'Editar operación no tomada':'Nueva operación no tomada'):SIM?(t?'Editar trade simulado':'Nuevo trade simulado'):(t?'Editar trade':'Nuevo trade')} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    ${MISSED?`<div class="insight warn" style="margin-bottom:14px">👀 <b>Operación no tomada</b>: un setup que se dio y no disparaste. Apunta por qué y el resultado que habría tenido siguiendo tu plan. No cuenta en tus estadísticas reales.</div>
+    <div class="field"><label>¿Por qué no disparaste? <span class="hint">puedes marcar varios</span></label>
+      <div id="f_missedReasons">${Object.entries(MISSED_GROUPS).map(([g,o])=>`<div style="margin-bottom:8px">
+        <div class="hint" style="font-weight:600;margin-bottom:5px"><span class="dot" style="background:${o.color};margin-right:5px"></span>${o.label}</div>
+        <div class="chips">${Object.entries(MISSED_REASONS).filter(([,r])=>r.g===g).map(([k,r])=>`<button type="button" class="chip ${(e.missedReasons||[]).includes(k)?'on':''}" data-reason="${k}" onclick="toggleMissedReason('${k}')">${r.l}</button>`).join('')}</div>
+      </div>`).join('')}</div>
+    </div>
+    <div class="field"><label>¿Cuándo la viste?</label>
+      <div class="chips" id="f_seen">${Object.entries(SEEN_LABELS).map(([k,l])=>`<button type="button" class="chip ${(e.seenLive||'live')===k?'on good':''}" data-seen="${k}" onclick="setSeen('${k}')">${l}</button>`).join('')}</div>
+    </div>`:SIM?`<div class="insight warn" style="margin-bottom:14px">🧪 <b>Trade simulado</b>: el setup que habrías tomado pero no operaste. Apunta el resultado que habría tenido siguiendo tu plan. No cuenta en tus estadísticas reales, cuentas ni calendario.</div>`:''}
     <div class="field"><label>Tipo de entrada</label>
       <select id="f_entryType" onchange="rebuildChecklist()">
         <option value="impulso" ${(e.entryType||'impulso')==='impulso'?'selected':''}>Impulso (precio ya en zona del macro)</option>
@@ -2385,7 +2551,7 @@ function tradeModal(t){
     ${copyHTML}
     <div class="field-row-3">
       <div class="field"><label>R planificado <span class="hint">tu objetivo</span></label><input type="number" id="f_plannedR" step="0.1" value="${e.plannedR??2}" oninput="checkHardRules()"></div>
-      <div class="field"><label>R realizado <span class="hint">lo que sacaste</span></label><input type="number" id="f_realizedR" step="0.1" value="${e.realizedR??''}" oninput="onRealizedRChange()" placeholder="-1 / 0 / 1.5"></div>
+      <div class="field"><label>${MISSED?'R que habría sacado <span class="hint">siguiendo tu plan</span>':'R realizado <span class="hint">lo que sacaste</span>'}</label><input type="number" id="f_realizedR" step="0.1" value="${e.realizedR??''}" oninput="onRealizedRChange()" placeholder="-1 / 0 / 1.5"></div>
       <div class="field"><label>Riesgo ($) <span class="hint">si es en varias cuentas, la suma</span></label><input type="number" id="f_riskUSD" value="${e.riskUSD??200}" oninput="onRealizedRChange()"></div>
     </div>
     <div class="calc-out" id="f_resultPreview" style="margin-bottom:14px;padding:12px 14px"></div>
@@ -2393,7 +2559,7 @@ function tradeModal(t){
     <div class="field"><label>P&L real ($) <span class="hint">se calcula solo, edítalo si el broker dio otra cifra</span></label>
       <input type="number" id="f_pnl" value="${e.pnl??''}" placeholder="auto">
     </div>
-    <div class="field"><label>¿Cómo saliste?</label>
+    <div class="field"><label>${MISSED?'¿Cómo habría acabado?':'¿Cómo saliste?'}</label>
       <select id="f_exitType" onchange="toggleBeFields()">
         <option value="target" ${(e.exitType||'target')==='target'?'selected':''}>TP completo (llegué a mi objetivo)</option>
         <option value="manual" ${e.exitType==='manual'?'selected':''}>Cierre manual (cerré antes del objetivo)</option>
@@ -2471,6 +2637,8 @@ function tradeModal(t){
     hide($('#f_resultPreview'));
   }
   $('#modalBg')._flags=[...flags];
+  $('#modalBg')._missedReasons=[...(e.missedReasons||[])];
+  $('#modalBg')._seen=e.seenLive||'live';
   $('#modalBg')._images=[...(SIM?(e.images||[]):tradeImgs(e))];
   $('#modalBg')._planChecked=[...planChecked];
   $('#modalBg')._planCheckedOrig=[...planChecked];
@@ -2722,9 +2890,14 @@ function toggleFlag(k){
 function saveTrade(id){
   const flags=$('#modalBg')._flags;
   const realizedR=parseFloat($('#f_realizedR').value);
-  const SIM=TRADE_MODE==='sim';
-  if(SIM) DB.paperTrades=DB.paperTrades||[];
-  const STORE=SIM?DB.paperTrades:DB.trades;
+  const MISSED=TRADE_MODE==='missed';
+  const SIM=TRADE_MODE==='sim'||MISSED;
+  if(TRADE_MODE==='sim') DB.paperTrades=DB.paperTrades||[];
+  if(MISSED){
+    DB.missedTrades=DB.missedTrades||[];
+    if(!($('#modalBg')._missedReasons||[]).length){ toast('Marca al menos un motivo de por qué no disparaste'); return; }
+  }
+  const STORE=MISSED?DB.missedTrades:SIM?DB.paperTrades:DB.trades;
   const existing=id?STORE.find(x=>x.id===id):null;
   const newChecked=$$('#f_plan input[type=checkbox]').filter(c=>c.checked).map(c=>+c.dataset.plan);
   const newEntryType=$('#f_entryType')?.value||'impulso';
@@ -2789,6 +2962,7 @@ function saveTrade(id){
     }
   }
   if(SIM){ Object.assign(t,{sim:true,account:'',phase:'',riskUSD:0,pnl:0,flags:['clean'],planChecked:newChecked,planTotal:planChecklist(newEntryType,'').length,setup:setupSel}); }
+  if(MISSED){ delete t.sim; Object.assign(t,{missed:true, missedReasons:[...$('#modalBg')._missedReasons], seenLive:$('#modalBg')._seen||'live'}); }
   // ---- Copias en otras cuentas (solo trades reales) ----
   const before=SIM?null:DB.trades.slice();
   let nSync=0, nNew=0;
@@ -2831,11 +3005,17 @@ function saveTrade(id){
   }
   closeModal(); render();
   const cp=(nSync?` · ${nSync} copia${nSync>1?'s':''} sincronizada${nSync>1?'s':''}`:'')+(nNew?` · añadido a ${nNew} cuenta${nNew>1?'s':''} más`:'');
-  if(SIM){ toast(id?'Simulado actualizado':'Trade simulado guardado'); }
+  if(MISSED){ toast(id?'Operación no tomada actualizada':'Operación no tomada guardada'); }
+  else if(SIM){ toast(id?'Simulado actualizado':'Trade simulado guardado'); }
   else if(id){ toast('Trade actualizado'+cp); }
   else { showMantra(processMantra(t)); if(nNew) toast(`Trade guardado en ${nNew+1} cuentas`); }
 }
 function deleteTrade(id){
+  if(TRADE_MODE==='missed'){
+    if(!confirm('¿Eliminar esta operación no tomada?'))return;
+    DB.missedTrades=(DB.missedTrades||[]).filter(t=>t.id!==id); save(); closeModal(); render(); toast('Operación eliminada');
+    return;
+  }
   if(TRADE_MODE==='sim'){
     if(!confirm('¿Eliminar este trade simulado?'))return;
     DB.paperTrades=(DB.paperTrades||[]).filter(t=>t.id!==id); save(); closeModal(); render(); toast('Simulado eliminado');
@@ -3459,6 +3639,18 @@ function buildAIReport(){
     minDayBySession(MD).forEach(([k,x])=>L.push(`  - ${k}: ${x.n} días (${x.w} ganados / ${x.l} perdidos) · acierto ${x.wr==null?'—':pct(x.wr)} (necesario ${x.beWR==null?'—':pct(x.beWR)}) · neto ${fmt$(x.net)} · peor ${x.worst==null?'—':fmt$(x.worst)}`));
     line();
     MD.forEach((t,i)=>tradeDetail(t,i,'D'));
+    line();
+  }
+  const MS=[...(DB.missedTrades||[])].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
+  if(MS.length){
+    L.push('## 8. OPERACIONES NO TOMADAS');
+    L.push('Setups que se dieron y el trader NO disparó, con el motivo y el resultado que habrían tenido siguiendo su plan. NO están en ninguna estadística de las secciones anteriores. "En directo" = las vio en el momento; "revisando" = las encontró después mirando el gráfico (sesgo de retrospectiva: menos fiables).');
+    const st=missedStats(MS);
+    L.push(`Total: ${st.n} (${MS.filter(t=>(t.seenLive||'live')==='live').length} en directo, ${MS.filter(t=>t.seenLive==='review').length} revisando) · habrían ganado ${st.w}, perdido ${st.l}, BE ${st.be} · resultado hipotético ${fmtR(st.r)} · ${st.exp==null?'—':fmtR(st.exp)} por operación`);
+    Object.keys(MISSED_GROUPS).forEach(g=>{ const a=MS.filter(t=>(t.missedReasons||[]).some(k=>missedGroupOf(k)===g)); if(a.length){ const x=missedStats(a); L.push(`  - Grupo ${MISSED_GROUPS[g].label}: ${x.n} · habrían ganado ${x.w} · resultado ${fmtR(x.r)}`); } });
+    Object.keys(MISSED_REASONS).forEach(k=>{ const a=MS.filter(t=>(t.missedReasons||[]).includes(k)); if(a.length){ const x=missedStats(a); L.push(`  - Motivo "${MISSED_REASONS[k].l}": ${x.n} · habrían ganado ${x.w} · resultado ${fmtR(x.r)}`); } });
+    line();
+    MS.forEach((t,i)=>{ tradeDetail(t,i,'N'); L.push(`  No tomada por: ${(t.missedReasons||[]).map(k=>(MISSED_REASONS[k]||{}).l||k).join(' · ')||'—'} · ${SEEN_LABELS[t.seenLive||'live']}`); });
     line();
   }
   L.push('=== FIN DEL INFORME ===');

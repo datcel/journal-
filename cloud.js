@@ -333,7 +333,7 @@ const Cloud=(()=>{
   /* ---------- capturas ---------- */
   function imageLists(db){
     const out=[];
-    ['trades','paperTrades','noTradeDays'].forEach(k=>(db[k]||[]).forEach(x=>{ if(x&&Array.isArray(x.images)) out.push(x.images); }));
+    ['trades','paperTrades','noTradeDays','missedTrades'].forEach(k=>(db[k]||[]).forEach(x=>{ if(x&&Array.isArray(x.images)) out.push(x.images); }));
     return out;
   }
   function hasDataImages(db){ return imageLists(db).some(a=>a.some(isData)); }
