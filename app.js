@@ -1814,14 +1814,15 @@ function calDayDetail(dateStr){
       const nCp=copySiblings(t).length;
       // capturas una sola vez por grupo de copias
       const showImg=!t.copyGroup||!shownG.has(t.copyGroup); if(t.copyGroup) shownG.add(t.copyGroup);
-      return `<div class="card" style="padding:12px;margin-bottom:8px">
-        <div style="display:flex;justify-content:space-between;align-items:center">
+      return `<div class="card" style="padding:12px;margin-bottom:8px;cursor:pointer" onclick="closeModal();editTrade('${t.id}')" title="Abrir para editar">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
           <div><b>${t.symbol}</b> <span class="hint">${isMinDay(t)?'📅 Día mínimo · ':''}${t.setup} · ${t.session}${t.account?' · '+t.account:''}${nCp?` · ⧉ copia (${nCp+1} cuentas)`:''}</span></div>
           <div style="font-family:var(--mono);font-weight:700" class="${cls(t.realizedR)}">${fmtR(t.realizedR)} · ${fmt$(t.pnl)}</div>
         </div>
         ${errs.length?`<div style="margin-top:6px">${errs.map(f=>`<span class="tag bad" style="margin:1px">${FLAG_LABELS[f]||f}</span>`).join('')}</div>`:''}
         ${t.note?`<div class="hint" style="margin-top:6px">${t.note}</div>`:''}
-        ${showImg&&tradeImgs(t).length?`<div class="thumb-row">${tradeImgs(t).map(img=>`<img class="thumb" ${imgAttrs(img)} onclick="lightbox(this.dataset.ref||this.src)">`).join('')}</div>`:''}
+        ${showImg&&tradeImgs(t).length?`<div class="thumb-row">${tradeImgs(t).map(img=>`<img class="thumb" ${imgAttrs(img)} onclick="event.stopPropagation();lightbox(this.dataset.ref||this.src)">`).join('')}</div>`:''}
+        <div class="hint" style="margin-top:8px;color:var(--blue);font-weight:600">✎ Toca para editar</div>
       </div>`;
     }).join(''); })()||'<p class="hint">Sin trades este día.</p>'}
     <div class="modal-actions"><button class="btn ghost" onclick="closeModal()">Cerrar</button></div>
@@ -1845,6 +1846,7 @@ function renderJournal(v, T){
                    JOURNAL_FILTER==='clean' ? T.filter(t=>!(t.flags||[]).some(f=>f!=='clean')) : T;
   v.innerHTML=`
     <div class="section-title">Journal</div>
+    <div class="hint" style="margin:-8px 0 12px">Toca cualquier trade para abrirlo y editarlo.</div>
     <div class="pill-row">
       <button class="chip ${JOURNAL_FILTER==='all'?'on good':''}" onclick="setJournalFilter('all')">Todos (${T.length})</button>
       <button class="chip ${JOURNAL_FILTER==='clean'?'on good':''}" onclick="setJournalFilter('clean')">Limpios</button>
@@ -1854,7 +1856,7 @@ function renderJournal(v, T){
       <thead><tr><th>Fecha</th><th>Símbolo</th><th>Setup</th><th>Sesión</th><th>Plan R</th><th>Real R</th><th>P&L</th><th>Estado</th><th>Flags</th><th></th></tr></thead>
       <tbody>${filtered.map(t=>{
         const errs=(t.flags||[]).filter(f=>f!=='clean');
-        return `<tr>
+        return `<tr onclick="editTrade('${t.id}')" style="cursor:pointer" title="Abrir para editar">
           <td>${t.date}</td>
           <td>${t.symbol||'—'}${tradeImgs(t).length?` <span title="${tradeImgs(t).length} imagen(es)" style="opacity:.6">📎</span>`:''}${copySiblings(t).length?` <span class="hint" title="Mismo trade copiado en: ${copySiblings(t).map(x=>(x.account||'sin cuenta').replace(/"/g,'&quot;')).join(', ')}">⧉${copySiblings(t).length+1}</span>`:''}</td>
           <td style="font-family:var(--sans)">${t.setup||'—'}${isMinDay(t)?' <span class="tag neutral" title="Día mínimo: va aparte de las estadísticas">📅 día mín.</span>':''}</td>
@@ -1864,7 +1866,7 @@ function renderJournal(v, T){
           <td class="${cls(t.pnl)}">${fmt$(t.pnl)}</td>
           <td><span class="tag ${t.result==='win'?'ok':t.result==='loss'?'bad':'neutral'}">${t.result==='win'?'Gan':t.result==='loss'?'Perd':'BE'}</span>${t.exitType==='manual'?' <span class="tag warn" title="cierre manual">✋</span>':''}</td>
           <td>${errs.length?errs.map(f=>`<span class="tag bad" style="margin:1px">${FLAG_LABELS[f]||f}</span>`).join(''):'<span class="tag ok">limpio</span>'}</td>
-          <td><button class="btn ghost sm icon" onclick="editTrade('${t.id}')">✎</button></td>
+          <td><button class="btn ghost sm icon" onclick="event.stopPropagation();editTrade('${t.id}')">✎</button></td>
         </tr>`;
       }).join('')}</tbody>
     </table></div>
