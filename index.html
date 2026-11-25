@@ -250,6 +250,13 @@ hr.sep{border:none;border-top:1px solid var(--line);margin:18px 0}
 .mantra .m-text{font-size:17px;font-weight:600;line-height:1.5;color:var(--ink)}
 .mantra .m-sub{font-size:12px;color:var(--ink-faint);margin-top:10px}
 .phase-btn.active .pf-count{color:var(--green)}
+
+/* ---------- Frenos (diario emocional) ---------- */
+.freno{border-radius:12px;padding:14px 16px;margin:0 0 16px;font-size:14px;line-height:1.5;font-weight:500}
+.freno b{display:block;font-size:16px;font-weight:700;margin-bottom:2px}
+.freno.loss{background:var(--red);color:#fff}
+.freno.win{background:var(--amber);color:#1a1200}
+.topbar-actions{flex-wrap:wrap;justify-content:flex-end}
 </style>
 </head>
 <body>
@@ -266,18 +273,21 @@ hr.sep{border:none;border-top:1px solid var(--line);margin:18px 0}
       <button class="btn ghost sm icon" id="exportBtn" title="Exportar copia de seguridad (con capturas)">⤓</button>
       <button class="btn ghost sm icon" id="importBtn" title="Importar datos">⤒</button>
       <button class="btn ghost sm icon" id="aiReportBtn" title="Exportar informe para IA">🤖</button>
+      <button class="btn ghost sm" id="checkinBtn" title="Check-in antes de operar">🧘 Antes</button>
       <button class="btn ghost sm" id="noTradeBtn" title="Registrar día sin trade">🚫 Sin trade</button>
       <button class="btn primary sm" id="addTradeBtn">+ Trade</button>
       <button class="btn ghost sm icon" id="logoutBtn" title="Cerrar sesión">⎋</button>
     </div>
   </header>
 
+  <div id="frenoBar"></div>
   <nav class="tabs" id="tabs">
     <button class="tab active" data-tab="overview">Resumen</button>
     <button class="tab" data-tab="discipline">Disciplina</button>
     <button class="tab" data-tab="performance">Rendimiento</button>
     <button class="tab" data-tab="sim">Simulados</button>
     <button class="tab" data-tab="missed">No tomadas</button>
+    <button class="tab" data-tab="psy">Psicología</button>
     <button class="tab" data-tab="roi">ROI</button>
     <button class="tab" data-tab="calendar">Calendario</button>
     <button class="tab" data-tab="journal">Journal</button>

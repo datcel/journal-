@@ -87,7 +87,8 @@ const DEFAULTS = {
   paperTrades: [],   // trades SIMULADOS (no operados): mismo formato que trades, sin cuenta ni dinero
   missedTrades: [],  // operaciones NO TOMADAS: setups que se dieron y no disparé (motivo + resultado que habrían tenido)
   firms: null,   // se inicializa desde FIRM_PRESETS la primera vez (así el usuario puede editarlas)
-  settings: { riskPerTradePct: 25 },
+  checkins: [],      // check-ins "antes de operar": {id, date, ts, animo, sueno, estado[], recuperar, expectativa}
+  settings: { riskPerTradePct: 25, frenos:{stops:3, wins:3} },
   meta: { created: Date.now() }
 };
 
@@ -138,6 +139,10 @@ function normalizeDB(raw){
       const acc=(base.accounts||[]).find(a=>a.name===t.account);
       if(acc) t.phase=acc.phase==='Funded'?'funded':'eval';
     });
+    // Frenos (diario emocional): valores por defecto si el journal es anterior
+    base.settings=Object.assign({riskPerTradePct:25},base.settings||{});
+    base.settings.frenos=Object.assign({stops:3,wins:3},base.settings.frenos||{});
+    if(!Array.isArray(base.checkins)) base.checkins=[];
     return base;
   }catch(e){
     const d = structuredClone(DEFAULTS);
@@ -167,7 +172,7 @@ const fmt = (n,d=2)=> (n==null||isNaN(n)) ? '—' : Number(n).toLocaleString('es
 const fmtR = n => (n>0?'+':'')+fmt(n,2)+'R';
 const fmt$ = n => (n<0?'-':'')+'$'+fmt(Math.abs(n),0);
 const cls = n => n>0?'pos':n<0?'neg':'neu';
-const todayISO = ()=> new Date().toISOString().slice(0,10);
+const todayISO = ()=> new Date().toLocaleDateString('sv-SE');   // AAAA-MM-DD en hora local
 
 function toast(msg){
   const t=$('#toast'); t.textContent=msg; t.classList.add('show');
@@ -211,6 +216,8 @@ const HELP_TEXTS={
   bymonth:['Rendimiento por mes','Tu expectancy, winrate, R acumulado y % de errores mes a mes. Sirve para ver tu evolución en el tiempo y si vas mejorando.'],
   missedtab:['Operaciones no tomadas','Setups que se dieron y no disparaste, con el motivo y el resultado que habrían tenido siguiendo tu plan. No cuentan en tus estadísticas reales. Sirven para ver qué te frena (análisis, psicología o gestión del riesgo) y cuánto R se queda fuera por cada motivo.'],
   missedtime:['Evolución','Cuántas operaciones dejas pasar cada semana, separadas por grupo de motivo. Lo ideal es que las psicológicas vayan bajando con el tiempo.'],
+  psytab:['Tu mapa psicológico','Lo que dicen tus datos, no tus sensaciones. Cruza cómo llegas a la sesión (check-in) y cómo te sientes en cada trade con tus resultados en R y tus errores.'],
+  frenos:['Frenos','Cuántos resultados seguidos en el mismo día activan el aviso. Al saltar, verás una franja arriba en toda la app y al abrir un trade nuevo.'],
   // Sizing
   kelly:['Kelly','Termómetro de tu edge, no tu sizing. Valida si tienes ventaja real. Necesita 30+ trades para ser fiable.'],
   roiglobal:['ROI global','Tu negocio de props: total gastado en cuentas vs total cobrado en payouts. El ROI % te dice cuánto recuperas por cada $ invertido.'],
@@ -601,7 +608,8 @@ function render(){
     ? `<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-start">${phaseFilterBar()}${showMonth?monthFilterBar():''}</div>`
     : '';
   const hasNoTrade=(DB.noTradeDays||[]).length>0;
-  if(CURRENT_TAB!=='roi' && CURRENT_TAB!=='sim' && CURRENT_TAB!=='missed' && !T.length && !(CURRENT_TAB==='calendar'&&hasNoTrade)){
+  renderFreno();
+  if(CURRENT_TAB!=='roi' && CURRENT_TAB!=='sim' && CURRENT_TAB!=='missed' && CURRENT_TAB!=='psy' && !T.length && !(CURRENT_TAB==='calendar'&&hasNoTrade)){
     // Hay trades pero ninguno con este filtro (mes / Eval-Funded): no mostrar "aún no hay trades"
     v.innerHTML = filterBars() + (DB.trades.length && showFilter
       ? `<div class="empty"><div class="ico">◴</div><p class="hint">No hay trades con este filtro. Cambia el mes o Eval/Funded.</p></div>`
@@ -616,7 +624,8 @@ function render(){
     calendar:renderCalendar,
     journal:renderJournal,
     sim:renderSim,
-    missed:renderMissed
+    missed:renderMissed,
+    psy:renderPsy
   })[CURRENT_TAB](v, T);
   if(CURRENT_TAB==='performance' && MD.length) v.insertAdjacentHTML('beforeend', minDayCard(MD));
   // prepend filter bar en pestañas de métricas
@@ -2328,6 +2337,217 @@ function renderMissed(v){
   }
 }
 
+/* ============================================================
+   DIARIO EMOCIONAL — check-in antes de operar + psicología de cada trade
+   ============================================================ */
+const PSY={
+  interp:{label:'Tipo de entrada',opts:['100% estrategia','Libre interpretación']},
+  tamano:{label:'Tamaño respecto a lo habitual',opts:['Menor','Igual','Mayor']},
+  reentrada:{label:'¿Es una reentrada después de un stop?',opts:['No','Sí']},
+  emoEntrada:{label:'Emoción dominante al entrar',opts:['Calma','Confianza','Euforia','Miedo','Ansiedad','FOMO','Frustración','Aburrimiento']},
+  emoSalida:{label:'Emoción al salir',opts:['Alivio','Satisfacción','Neutral','Euforia','Rabia','Frustración','Decepción']},
+  dialogo:{label:'¿Qué te has dicho sobre ti al ver el resultado?',hint:'La pregunta importante: aquí se ve si vuelves a identificarte con el resultado.',opts:['Es estadística','Hice bien mi trabajo','Soy muy bueno','Ya no sé hacer trading','Tengo que recuperar']}
+};
+const EGO_DIALOGS=['Soy muy bueno','Ya no sé hacer trading','Tengo que recuperar'];
+const BAD_EMOS=['Miedo','Ansiedad','FOMO','Frustración','Aburrimiento','Euforia'];
+const CHECKIN_STATES=['Tranquilo','Concentrado','Confiado','Eufórico','Ansioso','Cansado','Con prisa','Frustrado','Con miedo'];
+const hasErr=t=>(t.flags||[]).some(f=>f!=='clean');
+// Trades reales (sin días mínimos) en orden cronológico: fecha y, dentro del día, orden de registro
+function realChrono(){
+  return (DB.trades||[]).map((t,i)=>({t,i})).filter(x=>!isMinDay(x.t))
+    .sort((a,b)=> a.t.date<b.t.date?-1:a.t.date>b.t.date?1:((a.t.createdAt||0)-(b.t.createdAt||0))||(a.i-b.i)).map(x=>x.t);
+}
+// Racha desde el final (ignora BE): {n, k:'win'|'loss'}
+function tailStreak(arr){ let n=0,k=''; for(let i=arr.length-1;i>=0;i--){ const r=arr[i].result; if(r==='be') continue; if(!k) k=r; if(r!==k) break; n++; } return {n,k}; }
+function frenoState(){
+  const f=(DB.settings&&DB.settings.frenos)||{stops:3,wins:3};
+  const today=realChrono().filter(t=>t.date===todayISO());
+  const st=tailStreak(today);
+  if(st.k==='loss'&&st.n>=f.stops) return {kind:'loss',n:st.n};
+  if(st.k==='win'&&st.n>=f.wins) return {kind:'win',n:st.n};
+  return null;
+}
+function frenoHTML(){
+  const s=frenoState(); if(!s) return '';
+  return s.kind==='loss'
+    ? `<div class="freno loss"><b>Freno por pérdidas: ${s.n} stops seguidos hoy.</b>Es estadística, no un juicio sobre ti. Cierra las pantallas por hoy.</div>`
+    : `<div class="freno win"><b>Freno por euforia: ${s.n} TPs seguidos hoy.</b>Aquí empieza el exceso de confianza. Para o baja el tamaño, y vuelve a mirar tu plan.</div>`;
+}
+function renderFreno(){ const el=$('#frenoBar'); if(el) el.innerHTML=frenoHTML(); }
+// Formulario: chips de un solo valor
+function psyChipsHTML(name,cur){
+  const d=PSY[name];
+  return `<div class="field" id="f_psywrap_${name}"><label>${d.label}</label>${d.hint?`<div class="hint" style="margin:-2px 0 6px">${d.hint}</div>`:''}
+    <div class="chips" id="f_psy_${name}">${d.opts.map(o=>`<button type="button" class="chip ${cur===o?'on good':''}" data-v="${esc(o)}" onclick="psyPick('${name}',this)">${o}</button>`).join('')}</div></div>`;
+}
+function psyPick(name,btn){
+  const on=btn.classList.contains('on');
+  $$(`#f_psy_${name} .chip`).forEach(c=>c.className='chip');
+  if(!on) btn.className='chip on good';
+  if(name==='reentrada') togglePsyMinutes();
+}
+const psyVal=name=>$(`#f_psy_${name} .chip.on`)?.dataset.v||'';
+function togglePsyMinutes(){ const w=$('#f_psyMinWrap'); if(w) w.style.display=psyVal('reentrada')==='Sí'?'':'none'; }
+
+/* ---------- Check-in "antes de operar" ---------- */
+function openCheckinModal(c){
+  const e=c||{};
+  $('#modalBg').innerHTML=`<div class="modal">
+    <h2>${c?'Editar check-in':'Antes de abrir las pantallas'} <button class="btn ghost sm icon" onclick="closeModal()">✕</button></h2>
+    <div class="insight" style="margin-bottom:14px">Un minuto. Cómo llegas condiciona cómo vas a operar.</div>
+    <div class="field"><label>Fecha</label><input type="date" id="ci_date" value="${e.date||todayISO()}"></div>
+    <div class="field"><label>¿Cómo llegas hoy, del 1 al 10?</label>
+      <div style="display:flex;align-items:center;gap:14px"><input type="range" id="ci_animo" min="1" max="10" value="${e.animo??6}" style="flex:1;accent-color:var(--green)" oninput="ci_animoOut.textContent=this.value"><b id="ci_animoOut" style="font-family:var(--mono);font-size:28px;min-width:2ch;text-align:right;color:var(--green)">${e.animo??6}</b></div></div>
+    <div class="field"><label>¿Cuántas horas has dormido?</label><input type="number" id="ci_sueno" min="0" max="14" step="0.5" value="${e.sueno??''}" placeholder="7"></div>
+    <div class="field"><label>¿Qué sientes ahora mismo? <span class="hint">puedes marcar varias</span></label>
+      <div class="chips" id="ci_estado">${CHECKIN_STATES.map(x=>`<button type="button" class="chip ${(e.estado||[]).includes(x)?'on good':''}" data-v="${x}" onclick="this.classList.toggle('on');this.classList.toggle('good')">${x}</button>`).join('')}</div></div>
+    <div class="field"><label>¿Vienes a recuperar algo de días anteriores?</label>
+      <div class="chips" id="ci_recuperar">${['No','Sí'].map(x=>`<button type="button" class="chip ${e.recuperar===x?'on good':''}" data-v="${x}" onclick="$$('#ci_recuperar .chip').forEach(c=>c.className='chip');this.className='chip on good'">${x}</button>`).join('')}</div></div>
+    <div class="field"><label>¿Qué esperas de la sesión?</label><textarea id="ci_expect" rows="3" placeholder="Por ejemplo: solo entrar si el precio llega a mi zona de 4H y veo el quiebre en 5m">${esc(e.expectativa||'')}</textarea></div>
+    <div class="modal-actions">
+      ${c?`<button class="btn danger" onclick="deleteCheckin('${c.id}')">Eliminar</button>`:''}
+      <button class="btn ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn primary" onclick="saveCheckin('${c?c.id:''}')">${c?'Guardar':'Guardar y empezar'}</button>
+    </div>
+  </div>`;
+  $('#modalBg').classList.add('show');
+}
+function editCheckin(id){ openCheckinModal((DB.checkins||[]).find(x=>x.id===id)); }
+function saveCheckin(id){
+  const date=$('#ci_date').value||todayISO();
+  const prev=id?(DB.checkins||[]).find(x=>x.id===id):null;
+  const c={ id:id||uid(), date, ts:prev?.ts||Date.now(), animo:+$('#ci_animo').value,
+    sueno:$('#ci_sueno').value===''?null:+$('#ci_sueno').value,
+    estado:$$('#ci_estado .chip.on').map(b=>b.dataset.v),
+    recuperar:$('#ci_recuperar .chip.on')?.dataset.v||'',
+    expectativa:$('#ci_expect').value.trim() };
+  DB.checkins=DB.checkins||[];
+  if(id){ const i=DB.checkins.findIndex(x=>x.id===id); DB.checkins[i]=c; } else DB.checkins.push(c);
+  save(); closeModal(); render();
+  if(id) toast('Check-in actualizado');
+  else showMantra(c.recuperar==='Sí'?'Hoy vienes con ganas de recuperar. Ese día el freno tiene que estar más bajo: una operación de tu plan, y si sale mal, se cierra. 🧘':c.animo<=4||(c.sueno!=null&&c.sueno<6)?'Hoy no llegas al 100%. Opera más pequeño o solo tu setup más claro. 🧘':'Guardado. Buena sesión: tu plan, tus zonas, y nada más. 🧘');
+}
+function deleteCheckin(id){
+  if(!confirm('¿Eliminar este check-in?')) return;
+  DB.checkins=(DB.checkins||[]).filter(x=>x.id!==id); save(); closeModal(); render(); toast('Check-in eliminado');
+}
+// Importar check-ins del antiguo "Diario emocional" (pegando el texto que te da Claude)
+function importCheckins(){
+  let arr; try{ arr=JSON.parse($('#psyImport').value); }catch(e){ toast('El texto no es válido. Cópialo entero.'); return; }
+  if(!Array.isArray(arr)) arr=[arr];
+  DB.checkins=DB.checkins||[];
+  const ids=new Set(DB.checkins.map(x=>x.id)); let n=0;
+  arr.filter(x=>x&&x.tipo==='pre'&&x.id&&!ids.has(x.id)).forEach(x=>{
+    DB.checkins.push({id:x.id, date:x.dia||new Date(x.ts||Date.now()).toLocaleDateString('sv-SE'), ts:x.ts||Date.now(),
+      animo:+x.animo||6, sueno:x.sueno==null?null:+x.sueno, estado:Array.isArray(x.estado)?x.estado:[], recuperar:x.recuperar||'', expectativa:x.expectativa||''}); n++;
+  });
+  if(!n){ toast('No había check-ins nuevos que importar'); return; }
+  save(); render(); toast(`${n} check-in(s) importado(s)`);
+}
+function saveFrenos(){
+  DB.settings.frenos={stops:Math.max(1,+$('#frStops').value||3),wins:Math.max(1,+$('#frWins').value||3)};
+  save(); render(); toast('Frenos guardados');
+}
+
+/* ---------- Pestaña Psicología ---------- */
+function renderPsy(v){
+  const ops=realChrono(), C=[...(DB.checkins||[])].sort((a,b)=>a.date<b.date?1:a.date>b.date?-1:(b.ts||0)-(a.ts||0));
+  const withPsy=ops.filter(t=>t.emoEntrada||t.emoSalida||t.dialogo||t.interp||t.tamano||t.reentrada);
+  const f=DB.settings.frenos;
+  const E=a=>a.length?fmtR(expectancy(a)):'—';
+  const W=a=>a.some(t=>t.result!=='be')?fmt(winrate(a),0)+'%':'—';
+  const pct=(a,b)=>b?Math.round(a/b*100):0;
+  const est=ops.filter(t=>t.interp==='100% estrategia'), lib=ops.filter(t=>t.interp==='Libre interpretación');
+  const planOk=ops.filter(t=>!hasErr(t)).length;
+  const st=tailStreak(ops);
+  const animoMed=C.length?(C.reduce((s,c)=>s+(+c.animo||0),0)/C.length):null;
+  const head=`<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <div class="section-title" style="margin:0">Tu mapa psicológico ${helpIcon("psytab")}</div>
+      <button class="btn primary sm" onclick="openCheckinModal()">🧘 Antes de operar</button>
+    </div>`;
+  // ---- patrones ----
+  const A=[];
+  if(ops.length<3) A.push(['','Necesito al menos 3 trades registrados para empezar a ver patrones. Sigue rellenando, y no te olvides del apartado <b>Psicología</b> de cada trade.']);
+  else{
+    const pp=pct(planOk,ops.length);
+    const fc={}; ops.forEach(t=>(t.flags||[]).forEach(k=>{ if(k!=='clean') fc[k]=(fc[k]||0)+1; }));
+    const top=Object.entries(fc).sort((a,b)=>b[1]-a[1])[0];
+    if(ops.length>=5) A.push(pp<80?['bad',`Te saltas el plan en el <b>${100-pp}%</b> de los trades. El error que más se repite: <b>${top?FLAG_LABELS[top[0]]||top[0]:'—'}</b> (${top?top[1]:0} veces).`]:['ok',`Respetas el plan en el <b>${pp}%</b> de los trades. Bien.`]);
+    if(est.length>=3&&lib.length>=3&&expectancy(lib)<expectancy(est)-0.2) A.push(['bad',`Tus entradas de <b>libre interpretación</b> rinden ${E(lib)} por trade, frente a ${E(est)} las de <b>100% estrategia</b>.`]);
+    let rev=0, upWin=0;
+    for(let i=1;i<ops.length;i++){ const p=ops[i-1], o=ops[i];
+      if(p.result==='loss'&&(o.tamano==='Mayor'||(o.reentrada==='Sí'&&o.reentradaMin!=null&&!isNaN(o.reentradaMin)&&o.reentradaMin<15)||o.dialogo==='Tengo que recuperar')) rev++;
+      if(p.result==='win'&&o.tamano==='Mayor') upWin++; }
+    if(rev>=2) A.push(['bad',`<b>${rev} veces</b>, justo después de un stop, has subido el tamaño, reentrado en menos de 15 minutos o pensado en recuperar. Posible <b>revenge trading</b>.`]);
+    if(upWin>=2) A.push(['bad',`<b>${upWin} veces</b> has subido el tamaño justo después de un TP. Vigila el exceso de confianza.`]);
+    const re=ops.filter(t=>t.reentrada==='Sí');
+    if(re.length>=3&&expectancy(re)<expectancy(ops)-0.2) A.push(['',`Tus reentradas tras stop rinden ${E(re)} por trade, por debajo de tu media (${E(ops)}). Revisa si estaban en el plan o las justificas después.`]);
+    const dl=ops.filter(t=>t.dialogo), ego=dl.filter(t=>EGO_DIALOGS.includes(t.dialogo)).length;
+    if(dl.length>=3){ const e=pct(ego,dl.length); A.push(e>=30?['bad',`En el <b>${e}%</b> de los trades te has dicho algo sobre ti, no sobre la operación. Vuelves a identificarte con el resultado.`]:['ok',`Solo en el ${e}% de los trades te has identificado con el resultado. Sigue así.`]); }
+    const fp=ops.filter(t=>BAD_EMOS.includes(t.emoEntrada));
+    if(fp.length>=3&&expectancy(fp)<expectancy(ops)-0.2) A.push(['',`Cuando entras con miedo, ansiedad, FOMO, frustración, aburrimiento o euforia sacas ${E(fp)} por trade, frente a ${E(ops)} de media.`]);
+    // cruce con el check-in del día
+    const ciByDay={}; C.forEach(c=>{ if(!ciByDay[c.date]) ciByDay[c.date]=c; });
+    const low=ops.filter(t=>ciByDay[t.date]&&ciByDay[t.date].animo<=5), high=ops.filter(t=>ciByDay[t.date]&&ciByDay[t.date].animo>=6);
+    if(low.length>=3&&high.length>=3) A.push([expectancy(low)<expectancy(high)?'bad':'ok',`Los días que llegas con ánimo de 5 o menos sacas ${E(low)} por trade; con 6 o más, ${E(high)}.`]);
+    const tired=ops.filter(t=>ciByDay[t.date]&&ciByDay[t.date].sueno!=null&&ciByDay[t.date].sueno<6), rested=ops.filter(t=>ciByDay[t.date]&&ciByDay[t.date].sueno!=null&&ciByDay[t.date].sueno>=6);
+    if(tired.length>=3&&rested.length>=3) A.push([expectancy(tired)<expectancy(rested)?'bad':'ok',`Durmiendo menos de 6 horas sacas ${E(tired)} por trade; durmiendo 6 o más, ${E(rested)}.`]);
+  }
+  const rc=C.filter(c=>c.recuperar==='Sí').length;
+  if(rc>=2) A.push(['bad',`<b>${rc} sesiones</b> has empezado con la idea de recuperar. Ese día el freno de pérdidas tiene que estar más bajo.`]);
+  const tiredDays=C.filter(c=>c.sueno!=null&&c.sueno<6).length;
+  if(tiredDays>=2) A.push(['',`${tiredDays} sesiones has llegado durmiendo menos de 6 horas.`]);
+  if(!A.length) A.push(['ok','Sin patrones de riesgo claros por ahora. Cuantos más datos, más fino el mapa.']);
+  // ---- barras por emoción ----
+  const bars=(key,title)=>{
+    const g={}; ops.forEach(t=>{ if(t[key]) (g[t[key]]=g[t[key]]||[]).push(t); });
+    const rows=Object.entries(g).map(([k,a])=>({k,n:a.length,wr:a.some(t=>t.result!=='be')?winrate(a):null,exp:expectancy(a)})).sort((a,b)=>b.exp-a.exp);
+    if(!rows.length) return `<div class="card"><h3>${title}</h3><p class="hint">Aún no hay trades con este dato. Rellénalo en el apartado <b>Psicología</b> del trade.</p></div>`;
+    const mx=Math.max(...rows.map(r=>Math.abs(r.exp)),0.01);
+    return `<div class="card"><h3>${title}</h3><div style="display:flex;flex-direction:column;gap:10px">${rows.map(r=>`<div>
+      <div style="display:flex;justify-content:space-between;gap:8px;font-size:13px"><b>${esc(r.k)}</b><span style="font-family:var(--mono)"><span class="${cls(r.exp)}">${fmtR(r.exp)}</span> · ${r.wr==null?'—':fmt(r.wr,0)+'%'} · ${r.n}</span></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.abs(r.exp)/mx*100}%;background:${r.exp>=0?'var(--green)':'var(--red)'}"></div></div></div>`).join('')}</div>
+      <div class="hint" style="margin-top:8px">R por trade · acierto · nº de trades</div></div>`;
+  };
+  v.innerHTML=head+`
+    <div class="grid g-4" style="margin-bottom:14px">
+      ${statCard('Plan respetado', ops.length?pct(planOk,ops.length)+'%':'—', `${planOk} de ${ops.length} trades sin errores`, ops.length?(pct(planOk,ops.length)>=80?'pos':'neg'):'')}
+      ${statCard('100% estrategia', E(est), `libre interpretación: ${E(lib)}`, est.length?cls(expectancy(est)):'')}
+      ${statCard('Racha actual', st.n?`${st.n} ${st.k==='win'?'TP':'SL'}`:'—', `${withPsy.length} trades con datos emocionales`, st.k==='win'?'pos':st.k==='loss'?'neg':'')}
+      ${statCard('Ánimo medio', animoMed==null?'—':fmt(animoMed,1), `${C.length} check-ins`)}
+    </div>
+    <div class="card" style="margin-bottom:14px"><h3>Patrones detectados</h3>${A.map(([c,t])=>`<div class="insight ${c==='ok'?'':c==='bad'?'bad':'warn'}">${t}</div>`).join('')}</div>
+    <div class="grid g-2" style="margin-bottom:14px">
+      ${bars('emoEntrada','Según la emoción al entrar')}
+      ${bars('dialogo','Según lo que te dijiste al ver el resultado')}
+    </div>
+    <div class="grid g-2" style="margin-bottom:14px">
+      ${bars('emoSalida','Según la emoción al salir')}
+      ${bars('tamano','Según el tamaño respecto a lo habitual')}
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Frenos ${helpIcon("frenos")}</h3>
+      <div class="field-row-3" style="align-items:end">
+        <div class="field" style="margin:0"><label>Stops seguidos en un día</label><input type="number" id="frStops" min="1" max="10" value="${f.stops}"></div>
+        <div class="field" style="margin:0"><label>TPs seguidos en un día</label><input type="number" id="frWins" min="1" max="10" value="${f.wins}"></div>
+        <div class="field" style="margin:0"><button class="btn ghost" onclick="saveFrenos()">Guardar frenos</button></div>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <h3>Check-ins antes de operar</h3>
+      ${C.length?`<div style="display:flex;flex-direction:column;gap:6px">${C.slice(0,60).map(c=>{ const [y,m,d]=c.date.split('-');
+        return `<div onclick="editCheckin('${c.id}')" style="cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--line);border-radius:9px">
+          <div style="min-width:0"><div style="font-weight:600;font-size:13px">${d}/${m}/${y.slice(2)} · ánimo ${c.animo}/10${c.sueno!=null?' · '+fmt(c.sueno,1).replace(',0','')+' h de sueño':''}${c.recuperar==='Sí'?' · <span class="neg">viene a recuperar</span>':''}</div>
+          <div class="hint" style="margin-top:2px">${(c.estado||[]).join(', ')||'—'}${c.expectativa?' · '+esc(c.expectativa.length>110?c.expectativa.slice(0,110)+'…':c.expectativa):''}</div></div>
+          <span class="tag ${c.animo>=7?'ok':c.animo<=4?'bad':'neutral'}" style="flex-shrink:0">${c.animo}/10 ›</span></div>`; }).join('')}</div>`
+        :`<p class="hint">Aún no hay check-ins. Antes de cada sesión pulsa <b>🧘 Antes de operar</b>: un minuto que luego te dirá cómo influye tu estado en tus resultados.</p>`}
+      <details style="margin-top:12px"><summary class="hint" style="cursor:pointer">Importar check-ins del antiguo Diario emocional</summary>
+        <textarea id="psyImport" rows="4" style="width:100%;margin-top:8px;background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:10px;color:var(--ink);font-family:var(--mono);font-size:12px" placeholder="Pega aquí el texto que te ha dado Claude"></textarea>
+        <button class="btn ghost sm" style="margin-top:8px" onclick="importCheckins()">Importar</button>
+      </details>
+    </div>`;
+}
+
 // Modo del formulario de trade: 'real' (DB.trades), 'sim' (DB.paperTrades) o 'missed' (DB.missedTrades)
 let TRADE_MODE='real';
 function openTradeModal(){ TRADE_MODE='real'; tradeModal(); }
@@ -2614,6 +2834,17 @@ function tradeModal(t){
         ${Object.entries(FLAG_LABELS).map(([k,l])=>`<button type="button" class="chip ${flags.includes(k)?(k==='clean'?'on good':'on'):''}" data-flag="${k}" onclick="toggleFlag('${k}')">${l}</button>`).join('')}
       </div>
     </div>
+    <div class="plan-box" id="f_psy" style="margin-top:4px">
+      <div class="plan-title">🧠 Psicología <span class="hint" style="font-weight:400">rellénalo en cuanto cierres, con la emoción todavía fresca</span></div>
+      <div class="insight" style="margin:6px 0 12px">Antes de la próxima entrada: ¿ves claramente tu setup o estás buscando algo?</div>
+      ${psyChipsHTML('interp',e.interp)}
+      ${psyChipsHTML('tamano',e.tamano)}
+      ${psyChipsHTML('reentrada',e.reentrada)}
+      <div class="field" id="f_psyMinWrap"><label>¿Cuántos minutos pasaron desde el stop?</label><input type="number" id="f_psyMin" min="0" step="1" value="${e.reentradaMin??''}" placeholder="10"></div>
+      ${psyChipsHTML('emoEntrada',e.emoEntrada)}
+      ${psyChipsHTML('emoSalida',e.emoSalida)}
+      ${psyChipsHTML('dialogo',e.dialogo)}
+    </div>
     <div class="field"><label>Nota</label><textarea id="f_note" rows="2" placeholder="Contexto, qué viste, qué harías distinto...">${e.note||''}</textarea></div>
     <div class="field"><label>Capturas (gráficos, entradas...)</label>
       <div class="img-drop" id="f_imgdrop" onclick="document.getElementById('f_imgInput').click()">📎 Toca para adjuntar imágenes (se comprimen solas)</div>
@@ -2634,6 +2865,7 @@ function tradeModal(t){
     hide($('#f_riskUSD')?.closest?.('.field'));
     hide($('#f_pnl')?.closest?.('.field'));
     hide($('#f_flags')?.closest?.('.field'));
+    hide($('#f_psy'));
     hide($('#f_resultPreview'));
   }
   $('#modalBg')._flags=[...flags];
@@ -2653,6 +2885,9 @@ function tradeModal(t){
   toggleMoveOther();
   checkHardRules();
   toggleBeFields();
+  togglePsyMinutes();
+  // Freno activo: avisarlo al abrir un trade nuevo
+  if(!SIM && !t && frenoState()) $('#modalBg .modal h2').insertAdjacentHTML('afterend',frenoHTML());
 }
 // Muestra los campos de BE según lo que se haya elegido
 function toggleBeFields(){
@@ -2912,6 +3147,7 @@ function saveTrade(id){
   const own=planFor(newPhase);
   const t={
     id:id||uid(),
+    createdAt:existing?.createdAt||Date.now(),
     date:$('#f_date').value,
     symbol:$('#f_symbol').value.trim().toUpperCase(),
     setup: checklistUntouched ? setupSel : own.setup,
@@ -2944,6 +3180,9 @@ function saveTrade(id){
     mae:parseFloat($('#f_mae').value),
     flags:[...flags],
     note:$('#f_note').value.trim(),
+    interp:psyVal('interp'), tamano:psyVal('tamano'), reentrada:psyVal('reentrada'),
+    reentradaMin:psyVal('reentrada')==='Sí'?parseFloat($('#f_psyMin')?.value):NaN,
+    emoEntrada:psyVal('emoEntrada'), emoSalida:psyVal('emoSalida'), dialogo:psyVal('dialogo'),
     images:[...($('#modalBg')._images||[])],
     planChecked: checklistUntouched ? (existing.planChecked||[]) : own.planChecked,
     entryType:newEntryType,
@@ -2962,6 +3201,7 @@ function saveTrade(id){
     }
   }
   if(SIM){ Object.assign(t,{sim:true,account:'',phase:'',riskUSD:0,pnl:0,flags:['clean'],planChecked:newChecked,planTotal:planChecklist(newEntryType,'').length,setup:setupSel}); }
+  if(SIM){ ['interp','tamano','reentrada','emoEntrada','emoSalida','dialogo'].forEach(k=>t[k]=existing?.[k]||''); t.reentradaMin=existing?.reentradaMin; }
   if(MISSED){ delete t.sim; Object.assign(t,{missed:true, missedReasons:[...$('#modalBg')._missedReasons], seenLive:$('#modalBg')._seen||'live'}); }
   // ---- Copias en otras cuentas (solo trades reales) ----
   const before=SIM?null:DB.trades.slice();
@@ -3601,6 +3841,8 @@ function buildAIReport(){
     const errs=(t.flags||[]).filter(f=>f!=='clean');
     const ds=tradeDiscScore(t);
     L.push(`  Flags: ${errs.length?errs.map(f=>FLAG_LABELS[f]||f).join(', '):'limpio'}${errs.length?` · coste del error: ${fmtR(-tradeErrorCost(t)||0)}`:''} · nota de disciplina: ${ds==null?'—':discStyle(ds).label}${t.smt==='yes'?` · SMT (dato antiguo): ${t.smtResult}/${t.smtTiming}`:''}${(t.images&&t.images.length)?` · ${t.images.length} captura(s) no incluidas`:''}`);
+    const psy=[t.interp&&('entrada: '+t.interp), t.tamano&&('tamaño: '+t.tamano), t.reentrada&&('reentrada tras stop: '+t.reentrada+(t.reentradaMin!=null&&!isNaN(t.reentradaMin)?' ('+t.reentradaMin+' min)':'')), t.emoEntrada&&('emoción al entrar: '+t.emoEntrada), t.emoSalida&&('al salir: '+t.emoSalida), t.dialogo&&('se dijo: "'+t.dialogo+'"')].filter(Boolean);
+    if(psy.length) L.push(`  Psicología: ${psy.join(' · ')}`);
     if(t.note) L.push(`  Nota del trader: ${t.note.replace(/\s*\n\s*/g,' ')}`);
   };
   T.forEach((t,i)=>tradeDetail(t,i,'T'));
@@ -3641,6 +3883,13 @@ function buildAIReport(){
     MD.forEach((t,i)=>tradeDetail(t,i,'D'));
     line();
   }
+  const CI=[...(DB.checkins||[])].sort((a,b)=>a.date<b.date?-1:1);
+  if(CI.length){
+    L.push('## 9. CHECK-INS ANTES DE OPERAR (diario emocional)');
+    L.push('Antes de cada sesión el trader apunta su ánimo (1-10), horas de sueño, cómo se siente, si viene a recuperar pérdidas y qué espera de la sesión. Cruza estos datos con los trades del mismo día.');
+    CI.forEach(c=>{ const dayT=T.filter(t=>t.date===c.date); L.push(`- ${c.date} (${dow(c.date)}) · ánimo ${c.animo}/10 · sueño ${c.sueno??'—'} h · ${(c.estado||[]).join(', ')||'—'} · viene a recuperar: ${c.recuperar||'—'}${c.expectativa?' · espera: '+c.expectativa.replace(/\s*\n\s*/g,' '):''} · trades ese día: ${dayT.length}${dayT.length?' ('+fmtR(totalR(dayT))+')':''}`); });
+    line();
+  }
   const MS=[...(DB.missedTrades||[])].sort((a,b)=> a.date<b.date?-1: a.date>b.date?1:0);
   if(MS.length){
     L.push('## 8. OPERACIONES NO TOMADAS');
@@ -3678,6 +3927,7 @@ function init(){
   });
   $('#addTradeBtn').onclick=openTradeModal;
   $('#noTradeBtn').onclick=()=>openNoTradeModal();
+  if($('#checkinBtn')) $('#checkinBtn').onclick=()=>openCheckinModal();
   $('#fab').onclick=openTradeModal;
   $('#exportBtn').onclick=exportData;
   $('#aiReportBtn').onclick=exportAIReport;
