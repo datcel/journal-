@@ -1821,6 +1821,7 @@ function calDayDetail(dateStr){
         </div>
         ${errs.length?`<div style="margin-top:6px">${errs.map(f=>`<span class="tag bad" style="margin:1px">${FLAG_LABELS[f]||f}</span>`).join('')}</div>`:''}
         ${t.note?`<div class="hint" style="margin-top:6px">${t.note}</div>`:''}
+        ${videoLinks(t,true)}
         ${showImg&&tradeImgs(t).length?`<div class="thumb-row">${tradeImgs(t).map(img=>`<img class="thumb" ${imgAttrs(img)} onclick="event.stopPropagation();lightbox(this.dataset.ref||this.src)">`).join('')}</div>`:''}
         <div class="hint" style="margin-top:8px;color:var(--blue);font-weight:600">✎ Toca para editar</div>
       </div>`;
@@ -1858,7 +1859,7 @@ function renderJournal(v, T){
         const errs=(t.flags||[]).filter(f=>f!=='clean');
         return `<tr onclick="editTrade('${t.id}')" style="cursor:pointer" title="Abrir para editar">
           <td>${t.date}</td>
-          <td>${t.symbol||'—'}${tradeImgs(t).length?` <span title="${tradeImgs(t).length} imagen(es)" style="opacity:.6">📎</span>`:''}${copySiblings(t).length?` <span class="hint" title="Mismo trade copiado en: ${copySiblings(t).map(x=>(x.account||'sin cuenta').replace(/"/g,'&quot;')).join(', ')}">⧉${copySiblings(t).length+1}</span>`:''}</td>
+          <td>${t.symbol||'—'}${(t.videos||[]).length?` <span title="${t.videos.length} vídeo(s)" style="opacity:.7">▶</span>`:''}${tradeImgs(t).length?` <span title="${tradeImgs(t).length} imagen(es)" style="opacity:.6">📎</span>`:''}${copySiblings(t).length?` <span class="hint" title="Mismo trade copiado en: ${copySiblings(t).map(x=>(x.account||'sin cuenta').replace(/"/g,'&quot;')).join(', ')}">⧉${copySiblings(t).length+1}</span>`:''}</td>
           <td style="font-family:var(--sans)">${t.setup||'—'}${isMinDay(t)?' <span class="tag neutral" title="Día mínimo: va aparte de las estadísticas">📅 día mín.</span>':''}</td>
           <td>${t.session||'—'}</td>
           <td>${fmt(t.plannedR,1)}</td>
@@ -2853,6 +2854,10 @@ function tradeModal(t){
       <input type="file" id="f_imgInput" accept="image/*" multiple style="display:none" onchange="handleTradeImages(event)">
       <div class="thumb-row" id="f_thumbs"></div>
     </div>
+    <div class="field"><label>Vídeos de la operación <span class="hint">pega el enlace de YouTube, Drive, Loom…</span></label>
+      <div id="f_videos">${((e.videos&&e.videos.length)?e.videos:['']).map(videoRow).join('')}</div>
+      <button type="button" class="btn ghost sm" onclick="addVideoRow()">+ Añadir otro vídeo</button>
+    </div>
     <div class="modal-actions">
       ${t?`<button class="btn danger" onclick="deleteTrade('${t.id}')">Eliminar</button>`:''}
       <button class="btn ghost" onclick="closeModal()">Cancelar</button>
@@ -2892,6 +2897,19 @@ function tradeModal(t){
   if(!SIM && !t && frenoState()) $('#modalBg .modal h2').insertAdjacentHTML('afterend',frenoHTML());
 }
 // Muestra los campos de BE según lo que se haya elegido
+// ---------- Vídeos de la operación (enlaces: YouTube, Drive, Loom…) ----------
+const isUrl=u=>/^https?:\/\/\S+$/i.test(String(u||'').trim());
+function videoRow(u){
+  return `<div class="video-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+    <input type="url" class="f_video" value="${esc(u||'')}" placeholder="https://youtu.be/…" style="flex:1" autocomplete="off">
+    ${isUrl(u)?`<a class="btn ghost sm" href="${esc(u)}" target="_blank" rel="noopener" style="text-decoration:none">▶ Ver</a>`:''}
+    <button type="button" class="btn ghost sm icon" title="Quitar" onclick="this.parentNode.remove()">✕</button></div>`;
+}
+function addVideoRow(){ $('#f_videos').insertAdjacentHTML('beforeend',videoRow('')); $$('#f_videos .f_video').pop().focus(); }
+function videoLinks(t,stop){
+  const v=(t.videos||[]).filter(isUrl); if(!v.length) return '';
+  return `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">${v.map((u,i)=>`<a class="btn ghost sm" href="${esc(u)}" target="_blank" rel="noopener" style="text-decoration:none" ${stop?'onclick="event.stopPropagation()"':''}>▶ Vídeo${v.length>1?' '+(i+1):''}</a>`).join('')}</div>`;
+}
 function toggleBeFields(){
   const ex=$('#f_exitType')?.value, bm=$('#f_beMoved');
   if(!bm) return;
@@ -3125,6 +3143,8 @@ function toggleFlag(k){
   });
 }
 function saveTrade(id){
+  const vids=$$('#f_videos .f_video').map(i=>i.value.trim()).filter(Boolean);
+  if(vids.some(u=>!isUrl(u))){ toast('Algún enlace de vídeo no es válido: tiene que empezar por https://'); return; }
   const flags=$('#modalBg')._flags;
   const realizedR=parseFloat($('#f_realizedR').value);
   const MISSED=TRADE_MODE==='missed';
@@ -3182,6 +3202,7 @@ function saveTrade(id){
     mae:parseFloat($('#f_mae').value),
     flags:[...flags],
     note:$('#f_note').value.trim(),
+    videos:vids,
     interp:psyVal('interp'), tamano:psyVal('tamano'), reentrada:psyVal('reentrada'),
     reentradaMin:psyVal('reentrada')==='Sí'?parseFloat($('#f_psyMin')?.value):NaN,
     emoEntrada:psyVal('emoEntrada'), emoSalida:psyVal('emoSalida'), dialogo:psyVal('dialogo'),
@@ -3845,6 +3866,7 @@ function buildAIReport(){
     L.push(`  Flags: ${errs.length?errs.map(f=>FLAG_LABELS[f]||f).join(', '):'limpio'}${errs.length?` · coste del error: ${fmtR(-tradeErrorCost(t)||0)}`:''} · nota de disciplina: ${ds==null?'—':discStyle(ds).label}${t.smt==='yes'?` · SMT (dato antiguo): ${t.smtResult}/${t.smtTiming}`:''}${(t.images&&t.images.length)?` · ${t.images.length} captura(s) no incluidas`:''}`);
     const psy=[t.interp&&('entrada: '+t.interp), t.tamano&&('tamaño: '+t.tamano), t.reentrada&&('reentrada tras stop: '+t.reentrada+(t.reentradaMin!=null&&!isNaN(t.reentradaMin)?' ('+t.reentradaMin+' min)':'')), t.emoEntrada&&('emoción al entrar: '+t.emoEntrada), t.emoSalida&&('al salir: '+t.emoSalida), t.dialogo&&('se dijo: "'+t.dialogo+'"')].filter(Boolean);
     if(psy.length) L.push(`  Psicología: ${psy.join(' · ')}`);
+    if((t.videos||[]).length) L.push(`  Vídeos de la operación: ${t.videos.join(' · ')}`);
     if(t.note) L.push(`  Nota del trader: ${t.note.replace(/\s*\n\s*/g,' ')}`);
   };
   T.forEach((t,i)=>tradeDetail(t,i,'T'));
